@@ -10,6 +10,10 @@ export class Props {
     this.geysers = [];
     this.elevators = [];
     this.seesaws = [];
+    this.pendulums = [];
+    this.planks = [];
+    this.rollers = [];
+    this._rollTimer = 5;
     this._tmp = new THREE.Vector3();
     this._build();
   }
@@ -58,6 +62,125 @@ export class Props {
     this._crateStack(depot.clone().add(new THREE.Vector3(4, 0, 3)), 5);
     this._crateStack(side(0.3, 5), 3);
     this._crateStack(side(0.55, -5), 3);
+
+    // --- Pendulum logs sweeping across the trail ---
+    for (const t of [0.445, 0.56, 0.7, 0.83]) this._pendulum(t);
+
+    // --- Chasms: crumbling planks over most, a rescue mushroom at the bottom
+    // of each so falling in is a detour, not a death sentence ---
+    const GAPS = terrain.constructor.GAPS;
+    GAPS.forEach((g, i) => {
+      if (i % 3 !== 2) this._plank(g.t); // every third gap is plank-less: jump it
+      const pp = terrain.pathPoint(g.t);
+      const y = terrain.heightAt(pp.x, pp.z);
+      this._mushroom(new THREE.Vector3(pp.x, y, pp.z), 1.25);
+    });
+  }
+
+  _pendulum(t) {
+    const { terrain, scene, physics } = this.ctx;
+    const R = physics.RAPIER;
+    const p0 = terrain.pathPoint(t);
+    const p1 = terrain.pathPoint(t + 0.004);
+    const y = terrain.heightAt(p0.x, p0.z);
+    // Swing plane is ACROSS the trail: axis = path direction.
+    const dir = new THREE.Vector3(p1.x - p0.x, 0, p1.z - p0.z).normalize();
+    const anchor = new THREE.Vector3(p0.x, y + 7.5, p0.z);
+
+    const wood = new THREE.MeshStandardMaterial({ color: 0x7a5230, flatShading: true, roughness: 0.9 });
+    // Frame: two A-posts + crossbar.
+    for (const s of [-1, 1]) {
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.3, 7.5, 5), wood);
+      post.position.set(p0.x + dir.x * s * 2.2, y + 3.75, p0.z + dir.z * s * 2.2);
+      post.castShadow = true;
+      scene.add(post);
+    }
+    const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 4.8, 5), wood);
+    bar.position.copy(anchor);
+    bar.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    scene.add(bar);
+
+    // The log itself: kinematic, swung by code, hits like a truck.
+    const group = new THREE.Group();
+    const rope = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 5.2, 4), new THREE.MeshStandardMaterial({ color: 0x4a3826 }));
+    rope.position.y = 2.6;
+    const log = new THREE.Mesh(new THREE.CylinderGeometry(0.75, 0.75, 3.4, 7), wood);
+    log.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    group.add(rope, log);
+    group.traverse((o) => { o.castShadow = true; });
+    scene.add(group);
+    const body = physics.world.createRigidBody(R.RigidBodyDesc.kinematicPositionBased());
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+    physics.world.createCollider(
+      R.ColliderDesc.cylinder(1.7, 0.78).setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }).setFriction(0.4),
+      body,
+    );
+    this.pendulums.push({
+      group, body, anchor, dir,
+      len: 5.2, amp: 1.05, omega: 1.15 + Math.random() * 0.25, phase: Math.random() * 6,
+      swingAxis: dir.clone(),
+    });
+  }
+
+  _plank(gapT) {
+    const { terrain, scene, physics } = this.ctx;
+    const R = physics.RAPIER;
+    const p = terrain.pathPoint(gapT);
+    const before = terrain.pathPoint(gapT - 0.006);
+    const after = terrain.pathPoint(gapT + 0.006);
+    const a = new THREE.Vector3(before.x, before.h, before.z);
+    const b = new THREE.Vector3(after.x, after.h, after.z);
+    const mid = a.clone().add(b).multiplyScalar(0.5);
+    const len = a.distanceTo(b) + 1;
+    const yaw = Math.atan2(b.x - a.x, b.z - a.z);
+    const pitch = Math.atan2(b.y - a.y, Math.hypot(b.x - a.x, b.z - a.z));
+
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(2.0, 0.22, len),
+      new THREE.MeshStandardMaterial({ color: 0x9a7040, flatShading: true, roughness: 0.95 }),
+    );
+    mesh.castShadow = mesh.receiveShadow = true;
+    scene.add(mesh);
+    const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(-pitch, yaw, 0, 'YXZ'));
+    const body = physics.world.createRigidBody(
+      R.RigidBodyDesc.fixed().setTranslation(mid.x, mid.y, mid.z)
+        .setRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w }),
+    );
+    const col = physics.world.createCollider(R.ColliderDesc.cuboid(1.0, 0.11, len / 2).setFriction(0.9), body);
+    mesh.position.copy(mid);
+    mesh.quaternion.copy(quat);
+    this.planks.push({
+      mesh, body, col, mid: mid.clone(), quat: quat.clone(), len,
+      state: 'solid', timer: 0, respawn: 0,
+    });
+  }
+
+  _spawnRoller(t) {
+    const { terrain, scene, physics } = this.ctx;
+    const R = physics.RAPIER;
+    const p0 = terrain.pathPoint(t);
+    const p1 = terrain.pathPoint(t - 0.004); // downhill direction
+    const y = terrain.heightAt(p0.x, p0.z);
+    const across = new THREE.Vector3(p1.x - p0.x, 0, p1.z - p0.z).normalize().cross(new THREE.Vector3(0, 1, 0));
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.85, 0.85, 3.6, 8),
+      new THREE.MeshStandardMaterial({ color: 0x6e4a2b, flatShading: true, roughness: 0.9 }),
+    );
+    mesh.castShadow = true;
+    scene.add(mesh);
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), across);
+    const desc = R.RigidBodyDesc.dynamic()
+      .setTranslation(p0.x, y + 2, p0.z)
+      .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
+      .setCcdEnabled(true);
+    const body = physics.world.createRigidBody(desc);
+    physics.world.createCollider(R.ColliderDesc.cylinder(1.8, 0.85).setFriction(0.9).setMass(90), body);
+    physics.track(body, mesh);
+    const dl = new THREE.Vector3(p1.x - p0.x, 0, p1.z - p0.z).normalize();
+    body.setLinvel({ x: dl.x * 6, y: 0, z: dl.z * 6 }, true);
+    this.ctx.registerDynamic(body, 'roller');
+    this.rollers.push({ mesh, body, ttl: 16 });
+    this.ctx.sfx.wobble();
   }
 
   _mushroom(pos, scale = 1) {
@@ -222,6 +345,78 @@ export class Props {
             if (d.kind === 'player') player.airborneBySomethingFun = true;
           }
         }
+      }
+    }
+
+    // Pendulum logs: kinematic swing across the trail.
+    for (const pd of this.pendulums) {
+      const a = Math.sin(t * pd.omega + pd.phase) * pd.amp;
+      // Swing in the plane perpendicular to the trail (axis = trail direction).
+      const swing = new THREE.Quaternion().setFromAxisAngle(pd.swingAxis, a);
+      const offset = new THREE.Vector3(0, -pd.len, 0).applyQuaternion(swing);
+      const pos = pd.anchor.clone().add(offset);
+      pd.body.setNextKinematicTranslation({ x: pos.x, y: pos.y, z: pos.z });
+      pd.group.position.copy(pos);
+      pd.group.quaternion.copy(swing);
+      // visual rope points back to the anchor
+      pd.group.children[0].quaternion.identity();
+    }
+
+    // Crumbling planks: stand on one and the clock starts.
+    const pp = player.body.translation();
+    for (const pl of this.planks) {
+      if (pl.state === 'solid') {
+        const d = Math.hypot(pp.x - pl.mid.x, pp.z - pl.mid.z);
+        if (d < pl.len / 2 && pp.y > pl.mid.y - 1 && pp.y < pl.mid.y + 2.2 && player.grounded) {
+          pl.state = 'cracking';
+          pl.timer = 0.7;
+          sfx.crack(0.7);
+        }
+      } else if (pl.state === 'cracking') {
+        pl.timer -= dt;
+        pl.mesh.position.copy(pl.mid).x += (Math.random() - 0.5) * 0.06;
+        pl.mesh.position.z += (Math.random() - 0.5) * 0.06;
+        if (pl.timer <= 0) {
+          pl.state = 'falling';
+          pl.respawn = 9;
+          pl.body.setBodyType(this.ctx.physics.RAPIER.RigidBodyType.Dynamic, true);
+          pl.body.setLinvel({ x: 0, y: -2, z: 0 }, true);
+          this.ctx.physics.track(pl.body, pl.mesh);
+          sfx.shatter();
+        }
+      } else if (pl.state === 'falling') {
+        pl.respawn -= dt;
+        if (pl.respawn <= 0) {
+          pl.state = 'solid';
+          this.ctx.physics.untrack(pl.body);
+          pl.body.setBodyType(this.ctx.physics.RAPIER.RigidBodyType.Fixed, true);
+          pl.body.setTranslation({ x: pl.mid.x, y: pl.mid.y, z: pl.mid.z }, true);
+          pl.body.setRotation({ x: pl.quat.x, y: pl.quat.y, z: pl.quat.z, w: pl.quat.w }, true);
+          pl.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          pl.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+          pl.mesh.position.copy(pl.mid);
+          pl.mesh.quaternion.copy(pl.quat);
+        }
+      }
+    }
+
+    // Rolling logs in the forest band: spawned uphill of the courier.
+    const nearT = this.ctx.terrain._nearestPath(pp.x, pp.z).p.t;
+    if (nearT > 0.13 && nearT < 0.38) {
+      this._rollTimer -= dt;
+      if (this._rollTimer <= 0 && this.rollers.length < 3) {
+        this._rollTimer = 6 + Math.random() * 5 - Math.min(this.ctx.director?.level ?? 0, 5) * 0.6;
+        this._spawnRoller(Math.min(nearT + 0.03, 0.38));
+      }
+    }
+    for (let i = this.rollers.length - 1; i >= 0; i--) {
+      const r = this.rollers[i];
+      r.ttl -= dt;
+      if (r.ttl <= 0 || r.body.translation().y < -12) {
+        this.ctx.unregisterDynamic(r.body);
+        this.ctx.physics.removeBody(r.body);
+        this.ctx.scene.remove(r.mesh);
+        this.rollers.splice(i, 1);
       }
     }
 

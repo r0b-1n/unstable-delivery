@@ -79,6 +79,9 @@ export class PlayerController {
   }
 
   getCarryAnchor() {
+    // Between the courier's hands when the rig is loaded; fallback in front of chest.
+    const hands = this.ctx.character?.loaded && this.ctx.character.getHandsAnchor(this._anchor);
+    if (hands) return hands;
     const p = this.body.translation();
     this._fwd.set(Math.sin(this.charYaw ?? this.yaw), 0, Math.cos(this.charYaw ?? this.yaw));
     return this._anchor.set(p.x + this._fwd.x * 0.9, p.y + 0.15, p.z + this._fwd.z * 0.9);
@@ -87,6 +90,7 @@ export class PlayerController {
   knockdown(sec) {
     this.knockTimer = Math.max(this.knockTimer, sec);
     this.ctx.sfx.thud(1.6);
+    this.ctx.shake?.(0.55);
     this.ctx.packages.dropCarried();
     const p = this.body.translation();
     this.ctx.particles.dust(new THREE.Vector3(p.x, p.y - 0.5, p.z), 2);
@@ -200,9 +204,13 @@ export class PlayerController {
     }
     this._parachuteWasOn = this.parachute;
 
-    // --- Wind shoves you around when airborne (worse the higher you are) ---
+    // --- Wind shoves you around: hard when airborne, and from the cliffs
+    // upward it pushes even while your boots are on the ground. ---
     if (!this.grounded) {
       this.body.applyImpulse({ x: wind.x * m * 0.02 * dt, y: 0, z: wind.z * m * 0.02 * dt }, true);
+    } else if (zone.key === 'cliffs' || zone.key === 'frozen' || zone.key === 'summit') {
+      const g = this.onIce ? 0.016 : 0.009;
+      this.body.applyImpulse({ x: wind.x * m * g * dt, y: 0, z: wind.z * m * g * dt }, true);
     }
 
     // Footsteps
@@ -210,10 +218,18 @@ export class PlayerController {
       sfx.footstep(zone.key === 'frozen' || zone.key === 'summit' ? 'snow' : zone.key === 'cliffs' ? 'rock' : 'grass');
     }
 
-    // Landing dust + thud
+    // Landing dust + thud + real fall damage
     if (this.grounded && this._wasAirborne && this._lastVy < -8) {
       sfx.thud(Math.min(-this._lastVy / 16, 1.6));
       this.ctx.particles.dust(new THREE.Vector3(p.x, p.y - 0.9, p.z), Math.min(-this._lastVy / 10, 2.4));
+      this.ctx.shake?.(Math.min(-this._lastVy / 40, 0.6));
+      if (this._lastVy < -17) {
+        // Bone-rattler: knockdown, and the cargo feels it too.
+        this.knockdown(0.9);
+        const pkg = this.ctx.packages.current;
+        if (pkg && pkg.def.fragile) this.ctx.packages.damage(pkg, (-this._lastVy - 17) * 1.8);
+        this.ctx.hud.toast('🦴 That landing had consequences.', true);
+      }
     }
     this._wasAirborne = !this.grounded;
     this._lastVy = v.y;

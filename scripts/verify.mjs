@@ -195,6 +195,55 @@ const typesOk = await page.evaluate(async () => {
 });
 console.log('package types:', typesOk.join(' '));
 
+// --- Flight-exploit regression: balloon + egg must NOT lift the courier ---
+for (const typeIdx of [2, 3]) { // balloon, egg
+  const fly = await page.evaluate(async (idx) => {
+    const g = window.__game;
+    if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+    // flat ground near the depot
+    const c = g.ctx.packages.chutePos;
+    g.teleport(c.x - 5, c.y + 1.5, c.z - 5);
+    const def = g.ctx.packages.typeForDelivery(idx);
+    const pkg = g.ctx.packages.spawn(def);
+    pkg.carried = true;
+    const y0 = g.playerPos[1];
+    let maxY = y0;
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      maxY = Math.max(maxY, g.playerPos[1]);
+    }
+    if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+    return { id: def.id, rise: maxY - y0 };
+  }, typeIdx);
+  console.log('no-fly check:', JSON.stringify(fly));
+  if (fly.rise > 4) throw new Error(`Carrying ${fly.id} lifted the player ${fly.rise.toFixed(1)}m — flight exploit back`);
+}
+
+// --- Character rig sanity: parts exist and run cycle actually rotates the legs ---
+const rig = await page.evaluate(async () => {
+  const ch = window.__game.ctx.character;
+  const counts = {};
+  for (const k of ['armL', 'armR', 'legL', 'legR', 'headG']) {
+    counts[k] = ch[k] ? ch[k].children.reduce((n, c) => n + (c.geometry?.attributes.position?.count ?? 0), 0) : 0;
+  }
+  return counts;
+});
+console.log('rig parts (vertex counts):', JSON.stringify(rig));
+for (const [k, n] of Object.entries(rig)) if (n < 30) throw new Error(`Rig part ${k} nearly empty (${n} verts)`);
+
+// --- Event smoke test: force each event, run it, no errors ---
+for (const ev of ['gale', 'boulderRain', 'avalanche', 'thunder']) {
+  await page.evaluate(async (name) => {
+    const d = window.__game.ctx.director;
+    const p = window.__game.ctx.player.body.translation();
+    if (d.event) d.event.ttl = 0;
+    d._startEvent(name, p, { key: 'frozen' });
+    await new Promise((r) => setTimeout(r, 2500));
+    if (d.event) { d.event.ttl = 0; }
+  }, ev);
+}
+console.log('events smoke: ok');
+
 // --- Chaos soak: force high level, wander the frozen zone + summit for 25 s ---
 await page.evaluate(() => {
   window.__game.ctx.director.level = 7;

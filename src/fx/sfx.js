@@ -46,12 +46,13 @@ export class Sfx {
   }
 
   // altitude 0..1, gust 0..1 — the higher you climb, the angrier the air.
+  // Kept LOW and mellow: ambience, not a broken modem.
   setWind(altitude, gust) {
     if (!this.enabled) return;
     const t = this.ctx.currentTime;
-    const g = 0.02 + altitude * 0.14 + gust * 0.2;
-    this.windGain.gain.setTargetAtTime(Math.min(g, 0.4), t, 0.4);
-    this.windFilter.frequency.setTargetAtTime(220 + altitude * 500 + gust * 400, t, 0.5);
+    const g = 0.008 + altitude * 0.05 + gust * 0.09;
+    this.windGain.gain.setTargetAtTime(Math.min(g, 0.16), t, 0.6);
+    this.windFilter.frequency.setTargetAtTime(160 + altitude * 260 + gust * 220, t, 0.8);
   }
 
   _env(gainNode, t0, peak, attack, decay) {
@@ -94,11 +95,12 @@ export class Sfx {
 
   footstep(surface = 'grass') {
     const now = performance.now();
-    if (now - this._lastStep < 220) return;
+    if (now - this._lastStep < 240) return;
     this._lastStep = now;
-    if (surface === 'snow') this.noise({ freq: 900, peak: 0.06, decay: 0.07 });
-    else if (surface === 'rock') this.noise({ freq: 1600, peak: 0.05, decay: 0.05, type: 'highpass' });
-    else this.noise({ freq: 500, peak: 0.06, decay: 0.06 });
+    const vary = 0.8 + Math.random() * 0.4;
+    if (surface === 'snow') this.noise({ freq: 750 * vary, peak: 0.028, decay: 0.08 });
+    else if (surface === 'rock') this.noise({ freq: 1300 * vary, peak: 0.022, decay: 0.05, type: 'highpass' });
+    else this.noise({ freq: 420 * vary, peak: 0.028, decay: 0.07 });
   }
 
   thud(intensity = 1) {
@@ -203,7 +205,7 @@ export class Sfx {
       osc.frequency.value = 55;
       const g = this.ctx.createGain();
       g.gain.value = 0.0;
-      g.gain.setTargetAtTime(0.05, this.ctx.currentTime, 0.3);
+      g.gain.setTargetAtTime(0.028, this.ctx.currentTime, 0.3);
       osc.connect(g).connect(this.master);
       osc.start();
       this._hum = { osc, g };

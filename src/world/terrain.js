@@ -60,12 +60,30 @@ export class Terrain {
     }
   }
 
+  // Chasms cut across the trail in the upper zones — jump them, ride a
+  // mushroom out of them, or trust a crumbling plank.
+  static GAPS = [
+    { t: 0.415, w: 0.0035 },
+    { t: 0.505, w: 0.004 },
+    { t: 0.585, w: 0.0045 },
+    { t: 0.665, w: 0.004 },
+    { t: 0.735, w: 0.005 },
+    { t: 0.805, w: 0.0045 },
+    { t: 0.875, w: 0.0055 },
+    { t: 0.94, w: 0.005 },
+  ];
+
+  gapAt(t) {
+    for (const g of Terrain.GAPS) if (Math.abs(t - g.t) < g.w) return g;
+    return null;
+  }
+
   pathPoint(t) {
     const angle = t * LOOPS * Math.PI * 2 + 0.8;
     const radius = 196 - Math.pow(t, 0.95) * 178;
     const h = PEAK * Math.pow(t, 1.25) * 0.97 + 1.5;
-    const width = 9.5 - t * 5.5; // 9.5 m at the base, 4 m near the summit
-    return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius, h, t, width, angle };
+    const width = 9.5 - t * 6.7; // 9.5 m at the base, 2.8 m near the summit
+    return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius, h, t, width, angle, gap: this.gapAt(t) };
   }
 
   _nearestPath(x, z) {
@@ -95,27 +113,26 @@ export class Terrain {
     const count = pos.count;
     const colors = new Float32Array(count * 3);
     this.grid = new Float32Array((SEGMENTS + 1) * (SEGMENTS + 1));
+    const pathMixArr = new Float32Array(count);
 
-    const cMeadow = new THREE.Color(0x86cf58);
-    const cMeadow2 = new THREE.Color(0x5fae43);
-    const cForest = new THREE.Color(0x3e8948);
-    const cRock = new THREE.Color(0x77809c);
-    const cRock2 = new THREE.Color(0x5d6480);
-    const cIce = new THREE.Color(0x7fbdf2);
-    const cSnow = new THREE.Color(0xf2f8ff);
-    const cDirt = new THREE.Color(0xb08a54);
-    const cDirtSnow = new THREE.Color(0xcabb9e);
-    const col = new THREE.Color();
-
+    // ---- Pass 1: heights ----
     for (let i = 0; i < count; i++) {
       const x = pos.getX(i), z = pos.getZ(i);
       let h = this._rawHeight(x, z);
 
-      // Carve the spiral path into the slope.
+      // Carve the spiral path into the slope — or a chasm where a gap cuts it.
       const { p, d } = this._nearestPath(x, z);
       let pathMix = 0;
       const blend = 7;
-      if (d < p.width) { h = p.h; pathMix = 1; }
+      if (p.gap) {
+        // Chasm: drop well below trail level so falling in costs real height.
+        const chasmH = p.h - 14;
+        if (d < p.width + 1.5) { h = Math.min(h, chasmH); }
+        else if (d < p.width + blend) {
+          const k = 1 - THREE.MathUtils.smoothstep(d - p.width - 1.5, 0, blend - 1.5);
+          h = Math.min(h, THREE.MathUtils.lerp(h, chasmH, k));
+        }
+      } else if (d < p.width) { h = p.h; pathMix = 1; }
       else if (d < p.width + blend) {
         const k = 1 - THREE.MathUtils.smoothstep(d - p.width, 0, blend);
         h = THREE.MathUtils.lerp(h, p.h, k);
@@ -124,18 +141,62 @@ export class Terrain {
 
       pos.setY(i, h);
       this.grid[i] = h;
+      pathMixArr[i] = pathMix;
+    }
 
-      // Zone colouring with noisy banding.
-      const jitter = (fbm(x * 0.08, z * 0.08) - 0.5) * 14;
+    // ---- Pass 2: colours, now slope- and curvature-aware ----
+    const cMeadow = new THREE.Color(0x74ce3e);
+    const cMeadow2 = new THREE.Color(0x9fe25b);
+    const cForest = new THREE.Color(0x3d9c50);
+    const cRock = new THREE.Color(0x7d87a8);
+    const cRock2 = new THREE.Color(0x555e78);
+    const cIce = new THREE.Color(0x8ecdf5);
+    const cSnow = new THREE.Color(0xf6faff);
+    const cDirt = new THREE.Color(0xa8763e);
+    const cDirtSnow = new THREE.Color(0xcabb9e);
+    const cFlower = [new THREE.Color(0xffd166), new THREE.Color(0xff7bac), new THREE.Color(0xffffff)];
+    const col = new THREE.Color();
+    const W = SEGMENTS + 1;
+    const cell = SIZE / SEGMENTS;
+
+    for (let i = 0; i < count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const h = this.grid[i];
+      const gx = i % W, gz = (i / W) | 0;
+      const hx0 = this.grid[gz * W + Math.max(gx - 1, 0)], hx1 = this.grid[gz * W + Math.min(gx + 1, W - 1)];
+      const hz0 = this.grid[Math.max(gz - 1, 0) * W + gx], hz1 = this.grid[Math.min(gz + 1, W - 1) * W + gx];
+      const slope = Math.hypot(hx1 - hx0, hz1 - hz0) / (2 * cell);       // rise/run
+      const lap = (hx0 + hx1 + hz0 + hz1 - 4 * h) / cell;                 // concavity
+      const pathMix = pathMixArr[i];
+
+      const jitter = (fbm(x * 0.08, z * 0.08) - 0.5) * 10;
       const y = h + jitter;
-      if (y < 16) col.copy(cMeadow).lerp(cMeadow2, fbm(x * 0.1, z * 0.1));
-      else if (y < 52) col.copy(cForest).lerp(cMeadow2, fbm(x * 0.13, z * 0.13) * 0.7);
-      else if (y < 96) col.copy(cRock).lerp(cRock2, fbm(x * 0.15, z * 0.15));
-      else if (y < 138) col.copy(cIce).lerp(cRock, fbm(x * 0.12, z * 0.12) * 0.3);
-      else col.copy(cSnow);
-      if (pathMix > 0.25) {
+      if (y < 16) {
+        col.copy(cMeadow).lerp(cMeadow2, fbm(x * 0.11, z * 0.11));
+        // flower speckle
+        const f = hash2(Math.round(x * 2.1), Math.round(z * 2.1));
+        if (f > 0.965 && slope < 0.5) col.lerp(cFlower[(f * 977) % 3 | 0], 0.85);
+      } else if (y < 52) {
+        col.copy(cForest).lerp(cMeadow2, fbm(x * 0.13, z * 0.13) * 0.55);
+      } else if (y < 96) {
+        col.copy(cRock).lerp(cRock2, fbm(x * 0.15, z * 0.15));
+      } else if (y < 136) {
+        col.copy(cIce).lerp(cSnow, fbm(x * 0.09, z * 0.09) * 0.6);
+      } else {
+        col.copy(cSnow);
+      }
+      // Steep faces expose rock everywhere above the meadows.
+      if (h > 20) {
+        const rockK = THREE.MathUtils.smoothstep(slope, 0.85, 1.7);
+        col.lerp(cRock2, rockK * 0.85);
+      }
+      // Crevice shading: concave areas darken, ridges brighten slightly.
+      const shade = THREE.MathUtils.clamp(1 + lap * 0.05 - Math.max(slope - 1.6, 0) * 0.12, 0.72, 1.12);
+      col.multiplyScalar(shade);
+      // Crisp trail.
+      if (pathMix > 0.45) {
         const dirt = h > 100 ? cDirtSnow : cDirt;
-        col.lerp(dirt, pathMix * 0.75);
+        col.lerp(dirt, Math.min((pathMix - 0.45) / 0.4, 1) * 0.9);
       }
       colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
     }
@@ -300,6 +361,115 @@ export class Terrain {
       this.crystals.push(c);
     }
 
+    // --- Sea around the mountain base: low-poly waves via vertex shader hook ---
+    const seaGeo = new THREE.RingGeometry(200, 900, 48, 6);
+    seaGeo.rotateX(-Math.PI / 2);
+    const seaMat = new THREE.MeshStandardMaterial({
+      color: 0x2f74c0, roughness: 0.35, metalness: 0.1, flatShading: true,
+      transparent: true, opacity: 0.96,
+    });
+    seaMat.onBeforeCompile = (sh) => {
+      sh.uniforms.uTime = { value: 0 };
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nuniform float uTime;')
+        .replace('#include <begin_vertex>',
+          `#include <begin_vertex>
+           transformed.y += sin(position.x * 0.05 + uTime * 1.1) * 0.55 + cos(position.z * 0.06 + uTime * 0.8) * 0.45;`);
+      this._seaShader = sh;
+    };
+    const sea = new THREE.Mesh(seaGeo, seaMat);
+    sea.position.y = 0.5;
+    scene.add(sea);
+
+    // --- Lanterns lining the trail (emissive, no per-light cost) ---
+    const poleGeo = new THREE.CylinderGeometry(0.06, 0.08, 1.7, 4);
+    const poleMat = new THREE.MeshStandardMaterial({ color: 0x4a3826, flatShading: true });
+    const lampGeo = new THREE.SphereGeometry(0.17, 6, 5);
+    const lampMat = new THREE.MeshStandardMaterial({ color: 0xffd166, emissive: 0xffaa33, emissiveIntensity: 2.2 });
+    const nLan = 46;
+    const poles = new THREE.InstancedMesh(poleGeo, poleMat, nLan);
+    const lamps = new THREE.InstancedMesh(lampGeo, lampMat, nLan);
+    let li = 0;
+    for (let k = 0; k < nLan; k++) {
+      const t = 0.02 + (k / nLan) * 0.95;
+      if (this.gapAt(t)) continue;
+      const p = this.pathPoint(t);
+      const len = Math.hypot(p.x, p.z) || 1;
+      const x = p.x + (p.x / len) * (p.width + 1.2);
+      const z = p.z + (p.z / len) * (p.width + 1.2);
+      const h = this.heightAt(x, z);
+      if (Math.abs(h - p.h) > 4) continue; // off a cliff edge — skip
+      m.identity().setPosition(x, h + 0.85, z);
+      poles.setMatrixAt(li, m);
+      m.identity().setPosition(x, h + 1.8, z);
+      lamps.setMatrixAt(li, m);
+      li++;
+    }
+    poles.count = lamps.count = li;
+    scene.add(poles, lamps);
+
+    // --- Grass tufts + meadow detail ---
+    const tuftGeo = new THREE.ConeGeometry(0.16, 0.55, 4);
+    const tuftMat = new THREE.MeshStandardMaterial({ color: 0x57b234, flatShading: true });
+    const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, 320);
+    let ti = 0;
+    for (let i = 0; i < 2200 && ti < 320; i++) {
+      const a = hash2(i, 91.3) * Math.PI * 2;
+      const r = 120 + hash2(i, 93.7) * 115;
+      const x = Math.cos(a) * r, z = Math.sin(a) * r;
+      const h = this.heightAt(x, z);
+      if (h < 0.8 || h > 22) continue;
+      const s = 0.8 + hash2(i, 97.1) * 1.3;
+      m.makeScale(s, s * (0.8 + hash2(i, 5.5)), s).setPosition(x, h + 0.22 * s, z);
+      tufts.setMatrixAt(ti, m);
+      ti++;
+    }
+    tufts.count = ti;
+    scene.add(tufts);
+
+    // --- Snowy pines up high ---
+    const spineGeo = new THREE.ConeGeometry(1.6, 4.4, 6);
+    const spineMat = new THREE.MeshStandardMaterial({ color: 0x2c5a46, flatShading: true });
+    const scapGeo = new THREE.ConeGeometry(1.15, 1.7, 6);
+    const scapMat = new THREE.MeshStandardMaterial({ color: 0xf2f8ff, flatShading: true });
+    const spines = new THREE.InstancedMesh(spineGeo, spineMat, 40);
+    const scaps = new THREE.InstancedMesh(scapGeo, scapMat, 40);
+    spines.castShadow = true;
+    let si = 0;
+    for (let i = 0; i < 900 && si < 40; i++) {
+      const a = hash2(i, 111.3) * Math.PI * 2;
+      const r = 30 + hash2(i, 113.9) * 110;
+      const x = Math.cos(a) * r, z = Math.sin(a) * r;
+      const h = this.heightAt(x, z);
+      if (h < 95 || h > 145) continue;
+      const near = this._nearestPath(x, z);
+      if (near.d < near.p.width + 2) continue;
+      const s = 0.7 + hash2(i, 117.2) * 0.6;
+      m.makeScale(s, s, s).setPosition(x, h + 2.2 * s, z);
+      spines.setMatrixAt(si, m);
+      m.makeScale(s, s, s).setPosition(x, h + 4.4 * s, z);
+      scaps.setMatrixAt(si, m);
+      si++;
+    }
+    spines.count = scaps.count = si;
+    scene.add(spines, scaps);
+
+    // --- Birds circling thermals ---
+    this.birds = [];
+    const birdGeo = new THREE.ConeGeometry(0.25, 0.9, 3);
+    birdGeo.rotateX(Math.PI / 2);
+    const birdMat = new THREE.MeshStandardMaterial({ color: 0x2b2b33, flatShading: true });
+    for (let f = 0; f < 3; f++) {
+      const cx = Math.cos(f * 2.1) * (60 + f * 40);
+      const cz = Math.sin(f * 2.1) * (60 + f * 40);
+      const cy = 40 + f * 45;
+      for (let b = 0; b < 4; b++) {
+        const mesh = new THREE.Mesh(birdGeo, birdMat);
+        scene.add(mesh);
+        this.birds.push({ mesh, cx, cz, cy, r: 9 + b * 2.5, phase: b * 1.6 + f, speed: 0.5 + hash2(f, b) * 0.3 });
+      }
+    }
+
     // Drifting low-poly clouds.
     this.clouds = [];
     const cloudMat = new THREE.MeshStandardMaterial({ color: 0xffffff, flatShading: true, roughness: 1, transparent: true, opacity: 0.92 });
@@ -332,6 +502,15 @@ export class Terrain {
     for (const c of this.clouds) {
       c.g.position.x += c.speed * dt;
       if (c.g.position.x > WORLD_R + 60) c.g.position.x = -WORLD_R - 60;
+    }
+    if (this._seaShader) this._seaShader.uniforms.uTime.value = t;
+    for (const b of this.birds) {
+      const a = t * b.speed + b.phase;
+      const nx = b.cx + Math.cos(a) * b.r;
+      const nz = b.cz + Math.sin(a) * b.r;
+      const ny = b.cy + Math.sin(t * 0.7 + b.phase) * 2;
+      b.mesh.lookAt(nx, ny, nz);
+      b.mesh.position.set(nx, ny, nz);
     }
   }
 }

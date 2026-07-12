@@ -24,7 +24,7 @@ export const PACKAGE_TYPES = [
     warning: 'JUMPY WHEN STARTLED',
   },
   {
-    id: 'sheep', name: 'Sheep in a Crate', mass: 12, fragile: 0.5, windMult: 0.6,
+    id: 'sheep', name: 'Sheep in a Crate', mass: 12, fragile: 0.18, windMult: 0.6,
     note: '1× Angry Sheep. She did not agree to this.',
     warning: 'DO NOT SHAKE. Good luck.',
   },
@@ -61,18 +61,29 @@ export class Packages {
     const y = terrain.heightAt(p.x, p.z);
     this.chutePos = new THREE.Vector3(p.x, y, p.z);
 
-    // Depot: a wooden funnel chute + glowing pickup ring.
-    // Slight emissive so the underside isn't pitch black from below.
-    const wood = new THREE.MeshStandardMaterial({ color: 0xc08a52, emissive: 0x53381e, emissiveIntensity: 0.55, flatShading: true, roughness: 0.85 });
-    const chute = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 0.55, 1.6, 6), wood);
-    chute.position.set(p.x + 2.2, y + 3.6, p.z + 2.2);
-    chute.rotation.z = 0.3;
-    chute.castShadow = true;
-    scene.add(chute);
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, 3.6, 5), wood);
-    pole.position.set(p.x + 2.6, y + 1.8, p.z + 2.6);
-    pole.castShadow = true;
-    scene.add(pole);
+    // Depot: a small parcel kiosk + glowing pickup ring.
+    // Strong emissive so undersides don't read as black blobs.
+    const wood = new THREE.MeshStandardMaterial({ color: 0xc08a52, emissive: 0x6b4826, emissiveIntensity: 0.7, flatShading: true, roughness: 0.85 });
+    const kiosk = new THREE.Group();
+    const counter = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.0, 1.1), wood);
+    counter.position.y = 0.5;
+    const roofPost = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.11, 2.4, 5), wood);
+    roofPost.position.set(-0.9, 1.2, 0);
+    const roofPost2 = roofPost.clone();
+    roofPost2.position.x = 0.9;
+    const kioskRoof = new THREE.Mesh(
+      new THREE.BoxGeometry(2.6, 0.14, 1.5),
+      new THREE.MeshStandardMaterial({ color: 0xc94f4f, emissive: 0x5e2020, emissiveIntensity: 0.6, flatShading: true }),
+    );
+    kioskRoof.position.y = 2.5;
+    kioskRoof.rotation.z = 0.06;
+    const parcelPile = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.6), wood);
+    parcelPile.position.set(0.4, 1.25, 0);
+    kiosk.add(counter, roofPost, roofPost2, kioskRoof, parcelPile);
+    kiosk.position.set(p.x + 3.0, y, p.z + 2.6);
+    kiosk.lookAt(p.x, y, p.z);
+    kiosk.traverse((o) => { o.castShadow = true; });
+    scene.add(kiosk);
 
     this.ring = new THREE.Mesh(
       new THREE.TorusGeometry(1.7, 0.14, 6, 24),
@@ -265,6 +276,7 @@ export class Packages {
     if (exploded) {
       particles.explosion(this._tmpV);
       sfx.explosion();
+      this.ctx.shake?.(0.9);
       this._blast(this._tmpV);
     } else {
       particles.shards(this._tmpV, pkg.def.id === 'porcelain' ? 0xf0ead6 : 0xa9743f);
@@ -357,9 +369,14 @@ export class Packages {
         const fz = dz * k - v.z * c;
         body.resetForces(true);
         body.addForce({ x: fx, y: fy, z: fz }, true);
-        // Reaction on the courier (scaled down or the game is unplayable).
+        // Reaction on the courier: heavy cargo genuinely drags DOWN, but the
+        // upward component is clamped hard — a package pushed above the hands
+        // (balloons, hopping eggs) must never become a jetpack.
         const r = def.id === 'anvil' ? 0.35 : 0.12;
-        player.body.applyImpulse({ x: -fx * r * dt, y: -fy * r * 0.4 * dt, z: -fz * r * dt }, true);
+        let ry = -fy * r * 0.4;
+        const playerWeight = player.body.mass() * 22;
+        ry = Math.min(ry, playerWeight * 0.15);
+        player.body.applyImpulse({ x: -fx * r * dt, y: ry * dt, z: -fz * r * dt }, true);
       }
     } else {
       body.resetForces(true);
@@ -378,14 +395,32 @@ export class Packages {
     // --- Type behaviours ---
     switch (def.id) {
       case 'balloon': {
+        // Floaty for the COURIER, in a controlled way: an upward assist while
+        // carried (higher jumps, softer falls), capped so it can't turn into
+        // sustained flight.
+        if (pkg.carried) {
+          const pv = player.body.linvel();
+          if (pv.y < 3.5) {
+            const assist = player.body.mass() * 22 * 0.42;
+            player.body.applyImpulse({ x: 0, y: assist * dt, z: 0 }, true);
+          }
+        }
         this._tmpV.set(p.x, p.y + 1.6, p.z);
         if (Math.random() < dt * 2) particles.sparks(this._tmpV, 0xff9fd0, 1);
         break;
       }
       case 'egg': {
-        if (pkg.timer > 2.2 + Math.random() * 2.5) {
+        if (pkg.timer > 2.0 + Math.random() * 2.2) {
           pkg.timer = 0;
-          body.applyImpulse({ x: (Math.random() - 0.5) * def.mass * 5, y: def.mass * (pkg.carried ? 4 : 7), z: (Math.random() - 0.5) * def.mass * 5 }, true);
+          if (pkg.carried) {
+            // Startled egg kicks the COURIER sideways — never upward.
+            const a = Math.random() * Math.PI * 2;
+            player.body.applyImpulse({ x: Math.cos(a) * 220, y: 0, z: Math.sin(a) * 220 }, true);
+            body.applyImpulse({ x: (Math.random() - 0.5) * def.mass * 3, y: 0, z: (Math.random() - 0.5) * def.mass * 3 }, true);
+          } else {
+            // Loose egg makes a break for it downhill.
+            body.applyImpulse({ x: (Math.random() - 0.5) * def.mass * 8, y: def.mass * 5, z: (Math.random() - 0.5) * def.mass * 8 }, true);
+          }
           this._tmpV.set(p.x, p.y, p.z);
           particles.sparks(this._tmpV, 0x7ed957, 5);
           sfx.wobble();
@@ -398,7 +433,13 @@ export class Packages {
           pkg.timer = 0;
           const speed = Math.hypot(v.x, v.z);
           const anger = 1 + speed * 0.15;
-          body.applyImpulse({ x: (Math.random() - 0.5) * def.mass * 4 * anger, y: Math.random() * def.mass * 2.5 * anger, z: (Math.random() - 0.5) * def.mass * 4 * anger }, true);
+          // The kick mostly shoves the COURIER around; the crate itself takes
+          // a mild horizontal jolt so the sheep doesn't batter itself to death.
+          body.applyImpulse({ x: (Math.random() - 0.5) * def.mass * 3 * anger, y: 0, z: (Math.random() - 0.5) * def.mass * 3 * anger }, true);
+          if (pkg.carried) {
+            const a = Math.random() * Math.PI * 2;
+            player.body.applyImpulse({ x: Math.cos(a) * 180 * anger, y: 0, z: Math.sin(a) * 180 * anger }, true);
+          }
           sfx.baa();
         }
         break;
@@ -413,7 +454,7 @@ export class Packages {
         if (this._liquid) {
           this._liquid.material.emissiveIntensity = 0.8 + (pkg.shake / 100) * 3 * (0.6 + Math.sin(t * 20) * 0.4);
         }
-        if (pkg.shake > 70 && Math.random() < dt * 4) {
+        if (pkg.shake > 82 && Math.random() < dt * 2.5) {
           this._tmpV.set(p.x, p.y + 0.5, p.z);
           particles.sparks(this._tmpV, 0xb64fc8, 3);
           sfx.sizzle();

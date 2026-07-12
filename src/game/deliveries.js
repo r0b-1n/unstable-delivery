@@ -117,6 +117,7 @@ export class Deliveries {
     this._tmp.copy(this.beacon.position).add(new THREE.Vector3(0, 1.5, 0));
     particles.confetti(this._tmp);
     sfx.jingle();
+    this.ctx.music?.fanfare();
     hud.setScore(this.score);
     hud.setDeliveries(this.completed);
     hud.toast(`✅ DELIVERED! +${gained}`, false);
@@ -149,7 +150,7 @@ export class Deliveries {
 
   // HUD guidance: bearing + distance from the player to the beacon.
   update() {
-    const { hud, player, camera } = this.ctx;
+    const { hud, player, camera, packages } = this.ctx;
     const p = player.body.translation();
     const b = this.beacon.position;
     const dist = Math.hypot(b.x - p.x, b.y - p.y, b.z - p.z);
@@ -158,5 +159,13 @@ export class Deliveries {
     let rel = worldBearing - camBearing + Math.PI;
     hud.setTarget(rel, dist, this.target.name);
     hud.setAlt(p.y, zoneAt(p.y).name);
+    // Speed-bonus countdown while carrying.
+    if (packages.current?.carried) {
+      const par = 40 + this.target.pos.y * 1.4;
+      const elapsed = (performance.now() - this.pickupTime) / 1000;
+      hud.setTimer(par - elapsed);
+    } else {
+      hud.setTimer(null);
+    }
   }
 }

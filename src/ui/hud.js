@@ -19,7 +19,26 @@ export class Hud {
     this.slipBody = document.getElementById('slip-body');
     this.slipWarning = document.getElementById('slip-warning');
     this.vignette = document.getElementById('vignette-damage');
+    this.bannerEl = document.getElementById('hud-banner');
+    this.timerEl = document.getElementById('hud-timer');
     this._vignetteT = 0;
+  }
+
+  banner(text) {
+    if (!text) { this.bannerEl.style.display = 'none'; return; }
+    this.bannerEl.textContent = text;
+    this.bannerEl.style.display = 'block';
+  }
+
+  setTimer(secLeft) {
+    if (secLeft === null) { this.timerEl.textContent = ''; return; }
+    if (secLeft > 0) {
+      this.timerEl.textContent = `⚡ bonus ${Math.ceil(secLeft)}s`;
+      this.timerEl.className = '';
+    } else {
+      this.timerEl.textContent = 'bonus expired';
+      this.timerEl.className = 'expired';
+    }
   }
 
   show() { this.root.style.display = 'block'; }
