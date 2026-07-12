@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Unstable Delivery</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1530; }
+    body { font-family: 'Trebuchet MS', 'Segoe UI', system-ui, sans-serif; user-select: none; }
+    #app { position: fixed; inset: 0; }
+    canvas { display: block; }
+
+    /* ---------- Title screen ---------- */
+    #title-screen {
+      position: fixed; inset: 0; z-index: 40;
+      display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
+      background: radial-gradient(ellipse at 50% 30%, #21407a 0%, #0b1530 80%);
+      cursor: pointer;
+    }
+    #title-cover {
+      position: absolute; inset: 0;
+      background: url('./assets/cover.png') center 20% / cover no-repeat;
+      filter: saturate(1.05);
+    }
+    #title-cover::after {
+      content: ''; position: absolute; inset: 0;
+      background: linear-gradient(to bottom, rgba(11,21,48,0) 40%, rgba(11,21,48,0.92) 92%);
+    }
+    #title-bottom { position: relative; z-index: 2; text-align: center; padding-bottom: 5vh; }
+    #title-start {
+      font-size: 28px; font-weight: 800; color: #fff; letter-spacing: 1px;
+      text-shadow: 0 2px 8px #000;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: .65; transform: scale(.97);} }
+    #title-controls {
+      margin-top: 14px; color: #bcd3f5; font-size: 14px; line-height: 1.7;
+      text-shadow: 0 1px 4px #000;
+    }
+    #title-controls b { color: #ffd166; }
+    #title-loading { font-size: 22px; color: #9fc0ee; font-weight: 700; text-shadow: 0 2px 8px #000; }
+
+    /* ---------- HUD ---------- */
+    #hud { position: fixed; inset: 0; z-index: 20; pointer-events: none; display: none; }
+    .panel {
+      background: rgba(10, 20, 44, 0.72);
+      border: 2px solid rgba(140, 180, 240, 0.35);
+      border-radius: 12px;
+      color: #eaf2ff;
+      backdrop-filter: blur(3px);
+    }
+
+    #hud-top-left { position: absolute; top: 14px; left: 14px; padding: 10px 14px; min-width: 230px; }
+    #hud-package-name { font-size: 17px; font-weight: 800; color: #ffd166; }
+    #hud-package-note { font-size: 12px; color: #a8c4ea; margin-top: 2px; font-style: italic; }
+    .bar-wrap { margin-top: 7px; }
+    .bar-label { font-size: 10px; letter-spacing: 1.5px; color: #8fb0dd; }
+    .bar { height: 10px; border-radius: 5px; background: rgba(255,255,255,0.12); overflow: hidden; margin-top: 2px; }
+    .bar > div { height: 100%; border-radius: 5px; transition: width .15s ease-out; }
+    #bar-condition > div { background: linear-gradient(90deg, #45d17a, #a8e063); width: 100%; }
+    #bar-shake    > div { background: linear-gradient(90deg, #ffb347, #ff4d6d); width: 0%; }
+    #row-shake { display: none; }
+
+    #hud-top-right { position: absolute; top: 14px; right: 14px; padding: 10px 16px; text-align: right; }
+    #hud-score { font-size: 24px; font-weight: 900; color: #ffd166; }
+    #hud-deliveries { font-size: 12px; color: #a8c4ea; margin-top: 2px; }
+    #hud-alt { font-size: 13px; color: #bfe0ff; margin-top: 6px; font-weight: 700; }
+
+    /* Delivery direction indicator */
+    #hud-target {
+      position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+      padding: 8px 18px; text-align: center;
+    }
+    #hud-target-arrow { font-size: 22px; display: inline-block; transition: transform .1s linear; color: #ffd166; }
+    #hud-target-dist { font-size: 13px; font-weight: 800; color: #eaf2ff; }
+    #hud-target-label { font-size: 10px; letter-spacing: 1.5px; color: #8fb0dd; }
+
+    #hud-hint {
+      position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+      padding: 6px 16px; font-size: 12.5px; color: #bcd3f5; white-space: nowrap;
+    }
+    #hud-hint b { color: #ffd166; }
+
+    /* Center toasts */
+    #toast-holder {
+      position: absolute; top: 22%; left: 0; right: 0;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+    }
+    .toast {
+      padding: 10px 26px; font-size: 22px; font-weight: 900; color: #fff;
+      background: rgba(10, 20, 44, 0.8); border: 2px solid rgba(255, 209, 102, 0.6);
+      border-radius: 14px; text-shadow: 0 2px 6px #000;
+      animation: toast-in 3.2s ease-out forwards;
+    }
+    .toast.small { font-size: 15px; font-weight: 700; border-color: rgba(140,180,240,.4); }
+    @keyframes toast-in {
+      0% { opacity: 0; transform: translateY(-14px) scale(.9); }
+      8% { opacity: 1; transform: translateY(0) scale(1.04); }
+      12% { transform: scale(1); }
+      80% { opacity: 1; }
+      100% { opacity: 0; transform: translateY(-8px); }
+    }
+
+    /* Delivery slip */
+    #slip {
+      position: absolute; bottom: 60px; right: 18px; width: 250px;
+      background: #f5ecd7; color: #3a2c18; border-radius: 4px;
+      padding: 12px 14px; font-size: 13px; line-height: 1.5;
+      box-shadow: 0 6px 18px rgba(0,0,0,.45);
+      transform: rotate(2.5deg);
+      display: none;
+      font-family: 'Courier New', monospace;
+    }
+    #slip::before {
+      content: 'DELIVERY SLIP #' attr(data-num);
+      display: block; font-weight: 700; letter-spacing: 1px;
+      border-bottom: 2px dashed #b7a684; padding-bottom: 5px; margin-bottom: 7px;
+      font-size: 11px; color: #7a6238;
+    }
+    #slip-body b { font-size: 14.5px; }
+    #slip-warning { margin-top: 6px; font-weight: 700; color: #a83232; font-size: 12px; }
+
+    #vignette-damage {
+      position: absolute; inset: 0; pointer-events: none; opacity: 0;
+      background: radial-gradient(ellipse at center, transparent 55%, rgba(255,40,40,.55) 100%);
+      transition: opacity .1s;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="hud">
+    <div id="hud-top-left" class="panel">
+      <div id="hud-package-name">No package</div>
+      <div id="hud-package-note">Head to the depot chute!</div>
+      <div class="bar-wrap" id="row-condition">
+        <div class="bar-label">CONDITION</div>
+        <div class="bar" id="bar-condition"><div></div></div>
+      </div>
+      <div class="bar-wrap" id="row-shake">
+        <div class="bar-label">INSTABILITY</div>
+        <div class="bar" id="bar-shake"><div></div></div>
+      </div>
+    </div>
+
+    <div id="hud-top-right" class="panel">
+      <div id="hud-score">0</div>
+      <div id="hud-deliveries">0 deliveries</div>
+      <div id="hud-alt">ALT 0 m</div>
+    </div>
+
+    <div id="hud-target" class="panel">
+      <div id="hud-target-label">DELIVER TO</div>
+      <div><span id="hud-target-arrow">➤</span> <span id="hud-target-dist">--</span></div>
+    </div>
+
+    <div id="hud-hint" class="panel"><b>WASD</b> move · <b>Shift</b> sprint · <b>Space</b> jump / hold in air: parachute · <b>Mouse</b> camera</div>
+
+    <div id="toast-holder"></div>
+    <div id="slip" data-num="001"><div id="slip-body"></div><div id="slip-warning"></div></div>
+    <div id="vignette-damage"></div>
+  </div>
+
+  <div id="title-screen">
+    <div id="title-cover"></div>
+    <div id="title-bottom">
+      <div id="title-loading">Loading the mountain…</div>
+      <div id="title-start" style="display:none">CLICK TO START YOUR SHIFT</div>
+      <div id="title-controls" style="display:none">
+        <b>WASD</b> move &nbsp;·&nbsp; <b>Shift</b> sprint &nbsp;·&nbsp; <b>Space</b> jump (hold in air = parcel-parachute) &nbsp;·&nbsp; <b>Mouse</b> camera<br/>
+        Grab packages at the depot, haul them up the mountain, ride the cable car. Don't shake the potion.
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
