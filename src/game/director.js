@@ -23,6 +23,8 @@ export class Director {
     this._eventWarn = null;     // { name, ttl }
     this._eventTimer = 14;      // first event fairly early
     this.windMult = 1;
+    this.hazardPay = 0;         // accrues while carrying through a live event
+    this._closeCd = 0;          // close-call award cooldown
 
     this._boulderMat = new THREE.MeshStandardMaterial({ color: 0x5d6480, flatShading: true, roughness: 1 });
     this._snowMat = new THREE.MeshStandardMaterial({ color: 0xf2f8ff, flatShading: true, roughness: 0.9 });
@@ -54,9 +56,11 @@ export class Director {
 
     // --- Wind: rotating direction, layered gusts, event multiplier ---
     this._windAngle += dt * 0.03;
-    const gust01 = Math.max(0,
+    let gust01 = Math.max(0,
       Math.sin(t * 0.43) * 0.5 + Math.sin(t * 1.17 + 2) * 0.35 + Math.sin(t * 2.9) * 0.15,
     );
+    // A GALE that idles at zero gust is just weather with a banner: floor it.
+    if (this.event?.name === 'gale') gust01 = Math.max(gust01, 0.6);
     this.ctx.gust = gust01 * this.windMult;
     const strength = (2.5 + alt01 * 15 + Math.min(this.level, 8) * 1.1) * (0.3 + gust01) * this.windMult;
     wind.set(Math.cos(this._windAngle) * strength, 0, Math.sin(this._windAngle) * strength);
@@ -95,15 +99,50 @@ export class Director {
       }
     }
 
+    // --- Close-call bonuses: get grazed, get paid ---
+    this._closeCd = Math.max(0, this._closeCd - dt);
+    if (this._closeCd <= 0 && player.knockTimer <= 0) {
+      const pv = player.body.linvel();
+      for (const list of [this.boulders, this.snowballs]) {
+        for (const b of list) {
+          if (b.grazed) continue;
+          const bp = b.body.translation();
+          const d = Math.hypot(bp.x - p.x, bp.y - p.y, bp.z - p.z);
+          if (d > 2.3) continue;
+          const bv = b.body.linvel();
+          const rel = Math.hypot(bv.x - pv.x, bv.y - pv.y, bv.z - pv.z);
+          if (rel < 8) continue;
+          b.grazed = true;
+          this._closeCd = 1.5;
+          this.ctx.deliveries.addBonus(25, '😅 CLOSE ONE');
+          this.ctx.sfx.whoosh();
+          this.ctx.shake?.(0.08);
+          this._tmp.set((bp.x + p.x) / 2, (bp.y + p.y) / 2 + 0.5, (bp.z + p.z) / 2);
+          this.ctx.particles.sparks(this._tmp, 0xffffff, 5);
+        }
+      }
+    }
+
     // ---------- scheduled events ----------
     if (this.event) {
       this.event.ttl -= dt;
       this.event.tick(dt, t);
+      // Hazard pay: carrying cargo through the chaos accrues a bonus.
+      const pkg = this.ctx.packages.current;
+      if (pkg?.carried && p.y > 12) {
+        this.hazardPay += dt * 6;
+        this.ctx.hud.banner(`${EVENT_LABELS[this.event.name]}! · ☂ HAZARD PAY +${Math.floor(this.hazardPay)}`);
+      }
       if (this.event.ttl <= 0) {
         this.windMult = 1;
         this.ctx.hud.banner(null);
         this.event = null;
         this._eventTimer = Math.max(26 - this.level * 1.5, 12) + Math.random() * 10;
+        if (this.hazardPay >= 1) {
+          this.ctx.deliveries.addBonus(Math.floor(this.hazardPay), '☂ HAZARD PAY');
+          this.ctx.sfx.pickup();
+        }
+        this.hazardPay = 0;
       }
     } else if (this._eventWarn) {
       this._eventWarn.ttl -= dt;
@@ -140,7 +179,6 @@ export class Director {
     const mkEvent = {
       gale: () => {
         this.windMult = 3.4;
-        sfx.setWind(1, 1);
         return { name, ttl: 9, tick: (dt) => {
           if (Math.random() < dt * 8) this.ctx.shake?.(0.12);
         } };
@@ -193,6 +231,7 @@ export class Director {
         this.ctx.unregisterDynamic(b.body);
         this.ctx.physics.removeBody(b.body);
         this.ctx.scene.remove(b.mesh);
+        b.mesh.geometry.dispose(); // materials are shared module-level
         list.splice(i, 1);
       }
     }
@@ -201,9 +240,8 @@ export class Director {
   _spawnBoulder(playerPos, sizeScale = 1) {
     const { terrain, physics, scene, hud } = this.ctx;
     const R = physics.RAPIER;
-    const near = terrain._nearestPath(playerPos.x, playerPos.z);
-    const t = Math.min(near.p.t + 0.035, 0.99);
-    const pp = terrain.pathPoint(t);
+    // ~28 m up the trail — close enough to actually arrive as a threat.
+    const pp = terrain.pathAheadOf(playerPos.x, playerPos.z, 28);
     const y = terrain.heightAt(pp.x, pp.z) + 6;
     const r = (0.9 + Math.random() * 0.8) * sizeScale;
     const mesh = new THREE.Mesh(new THREE.DodecahedronGeometry(r, 0), this._boulderMat);
@@ -243,9 +281,7 @@ export class Director {
     const { terrain, physics, scene, player } = this.ctx;
     const R = physics.RAPIER;
     const p = player.body.translation();
-    const near = terrain._nearestPath(p.x, p.z);
-    const t = Math.min(near.p.t + 0.02 + Math.random() * 0.03, 0.99);
-    const pp = terrain.pathPoint(t);
+    const pp = terrain.pathAheadOf(p.x, p.z, 18 + Math.random() * 18);
     const off = (Math.random() - 0.5) * 14;
     const len = Math.hypot(pp.x, pp.z) || 1;
     const x = pp.x + (pp.x / len) * off;
@@ -297,12 +333,19 @@ export class Director {
       }
       if (ic.dropped && Math.abs(iv.y) > 2) ic.air += dt;
       if (landed || ic.ttl <= 0 || ip.y < KILL_Y) {
-        this._tmp.set(ip.x, ip.y, ip.z);
-        this.ctx.particles.shards(this._tmp, 0xbfe6ff);
-        this.ctx.sfx.crack(1);
+        // Shatter FX only for an actual landing near the player — no phantom
+        // full-volume cracks from far-away or timed-out icicles.
+        const pp = this.ctx.player.body.translation();
+        const near = Math.hypot(ip.x - pp.x, ip.y - pp.y, ip.z - pp.z) < 45;
+        if (landed && near) {
+          this._tmp.set(ip.x, ip.y, ip.z);
+          this.ctx.particles.shards(this._tmp, 0xbfe6ff);
+          this.ctx.sfx.crack(1);
+        }
         this.ctx.unregisterDynamic(ic.body);
         this.ctx.physics.removeBody(ic.body);
         this.ctx.scene.remove(ic.mesh);
+        ic.mesh.geometry.dispose();
         this.icicles.splice(i, 1);
       }
     }

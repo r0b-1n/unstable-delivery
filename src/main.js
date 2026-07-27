@@ -85,11 +85,13 @@ scene.add(sun, sun.target);
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // monitor moves change DPR
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
 // ---------- Game context shared by every subsystem ----------
-let trauma = 0; // screen shake accumulator
+let trauma = 0;   // screen shake accumulator
+let hitstopT = 0; // brief slow-motion on big impacts
 
 const ctx = {
   scene, camera, renderer,
@@ -106,6 +108,7 @@ const ctx = {
     if (i >= 0) this.dynamics.splice(i, 1);
   },
   shake(amt) { trauma = Math.min(1, trauma + amt); },
+  hitstop(sec) { hitstopT = Math.max(hitstopT, sec); },
 };
 
 let state = 'loading';
@@ -160,9 +163,9 @@ renderer.domElement.addEventListener('click', () => {
 });
 
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'KeyM' && ctx.music?.playing !== undefined) {
+  if (e.code === 'KeyM' && state === 'playing') {
     const on = ctx.music.toggle();
-    ctx.hud?.toast(on ? '🎵 Music on' : '🔇 Music off', true);
+    ctx.hud.toast(on ? '🎵 Music on' : '🔇 Music off', true);
   }
 });
 
@@ -184,13 +187,20 @@ const clock = new THREE.Clock();
 
 function frame() {
   requestAnimationFrame(frame);
-  const dt = Math.min(clock.getDelta(), 0.1);
-  fps = fps * 0.95 + (1 / Math.max(dt, 1e-4)) * 0.05;
+  const realDt = Math.min(clock.getDelta(), 0.1);
+  fps = fps * 0.95 + (1 / Math.max(realDt, 1e-4)) * 0.05;
 
   if (state !== 'playing') {
     // Idle orbit behind the title screen (cheap, hidden anyway).
     renderer.render(scene, camera);
     return;
+  }
+
+  // Hitstop: the world freezes for a few frames on big impacts.
+  let dt = realDt;
+  if (hitstopT > 0) {
+    hitstopT -= realDt;
+    dt = realDt * 0.06;
   }
 
   ctx.physics.step(dt, (fdt) => {
@@ -241,6 +251,10 @@ function frame() {
   camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(dt * 5, 1));
   camera.updateProjectionMatrix();
 
+  // Airspeed rush: wind-in-the-ears noise swells with total velocity.
+  const speed3 = Math.hypot(v.x, v.y, v.z);
+  ctx.sfx.setRush(THREE.MathUtils.clamp((speed3 - 9) / 14, 0, 1));
+
   // Music intensity follows danger: altitude, live events, ticking potion.
   const pkg = ctx.packages.current;
   ctx.music.setIntensity(
@@ -249,7 +263,7 @@ function frame() {
     + ((pkg?.carried && pkg.shake > 50) ? 0.2 : 0),
   );
 
-  ctx.particles.update(dt, camera, alt01, ctx.wind);
+  ctx.particles.update(dt, camera, alt01, ctx.wind, ctx.gust);
   renderer.render(scene, camera);
 }
 

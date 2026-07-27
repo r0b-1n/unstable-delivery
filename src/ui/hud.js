@@ -21,7 +21,10 @@ export class Hud {
     this.vignette = document.getElementById('vignette-damage');
     this.bannerEl = document.getElementById('hud-banner');
     this.timerEl = document.getElementById('hud-timer');
+    this.chainEl = document.getElementById('hud-chain');
+    this.popHolder = document.getElementById('pop-holder');
     this._vignetteT = 0;
+    this._scoreShown = 0;
   }
 
   banner(text) {
@@ -64,18 +67,60 @@ export class Hud {
       : pct > 25
         ? 'linear-gradient(90deg, #ffb347, #ffd166)'
         : 'linear-gradient(90deg, #ff4d6d, #ff8080)';
+    this.barCondition.parentElement.classList.toggle('crit', pct <= 25 && pct > 0);
   }
 
   setShake(pct) { this.barShake.style.width = `${pct}%`; }
-  setScore(n) { this.score.textContent = String(n); }
+
+  // Score counts up instead of teleporting — small numbers feel earned too.
+  setScore(n) {
+    cancelAnimationFrame(this._scoreRaf);
+    const from = this._scoreShown;
+    const t0 = performance.now();
+    const dur = 500;
+    const tick = (now) => {
+      const k = Math.min((now - t0) / dur, 1);
+      this._scoreShown = Math.round(from + (n - from) * (1 - Math.pow(1 - k, 3)));
+      this.score.textContent = String(this._scoreShown);
+      if (k < 1) this._scoreRaf = requestAnimationFrame(tick);
+    };
+    this._scoreRaf = requestAnimationFrame(tick);
+  }
+
   setDeliveries(n) { this.deliveries.textContent = `${n} deliver${n === 1 ? 'y' : 'ies'}`; }
+
+  setChain(chain) {
+    const mult = 1 + 0.5 * Math.min(chain, 4);
+    if (chain < 2) { this.chainEl.style.display = 'none'; return; }
+    this.chainEl.style.display = 'block';
+    this.chainEl.textContent = `🔥 ×${mult.toFixed(1)} ON A ROLL`;
+    this.chainEl.classList.remove('pop');
+    void this.chainEl.offsetWidth; // restart the pop animation
+    this.chainEl.classList.add('pop');
+  }
+
+  // Itemized floating score receipt (delivery breakdown, bonuses).
+  scorePop(lines) {
+    const el = document.createElement('div');
+    el.className = 'score-pop';
+    for (const line of lines) {
+      const row = document.createElement('div');
+      row.textContent = line;
+      el.appendChild(row);
+    }
+    this.popHolder.appendChild(el);
+    setTimeout(() => el.remove(), 2600);
+    while (this.popHolder.children.length > 3) this.popHolder.firstChild.remove();
+  }
 
   setAlt(y, zoneName) {
     this.alt.textContent = `ALT ${Math.max(0, Math.round(y))} m · ${zoneName}`;
   }
 
   setTarget(relBearing, dist, name) {
-    this.targetArrow.style.transform = `rotate(${relBearing - Math.PI / 2}rad)`;
+    // World bearings are counter-clockwise, CSS rotation is clockwise —
+    // negate or the arrow mirrors left/right.
+    this.targetArrow.style.transform = `rotate(${-relBearing - Math.PI / 2}rad)`;
     this.targetDist.textContent = dist > 999 ? `${(dist / 1000).toFixed(1)} km` : `${Math.round(dist)} m`;
     this.targetLabel.textContent = `DELIVER TO · ${name.toUpperCase()}`;
   }

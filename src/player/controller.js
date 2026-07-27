@@ -20,6 +20,11 @@ export class PlayerController {
     this.parachute = false;
     this._parachuteWasOn = false;
     this.airborneBySomethingFun = false;
+    this.lastLaunchT = -99;   // gameTime of the last mushroom/geyser launch (airmail bonus)
+    this.rollTimer = 0;       // recovery-roll animation window
+    this.slide = false;       // belly-slide state
+    this._slideCd = 0;
+    this._puntCd = 0;
     this.yaw = 2.5;
     this.pitch = 0.32;
     this.camDist = 7;
@@ -54,10 +59,20 @@ export class PlayerController {
     this.collider = physics.world.createCollider(col, this.body);
     physics.onContactForce(this.collider, (other, mag) => {
       // ~ mass * deltaV / dt: knock down only on truly violent hits (fast
-      // boulders, huge falls) — not on ordinary hard landings.
-      if (mag > 115000 && this.knockTimer <= 0) this.knockdown(0.9);
+      // boulders, huge falls) — not on ordinary hard landings. A buffered
+      // Space (recovery roll incoming) or an active roll absorbs the hit.
+      if (mag > 115000 && this.knockTimer <= 0 && this.jumpBuffer <= 0 && this.rollTimer <= 0) this.knockdown(0.9);
     });
     this.ctx.registerDynamic(this.body, 'player');
+    // Interpolated pose for render-rate consumers (camera, character root).
+    this.syncEntry = physics.track(this.body, null);
+    this._groundBall = new R.Ball(0.3);
+    this._camRay = new R.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: -1, z: 0 });
+  }
+
+  // Render-rate position, interpolated between physics steps.
+  renderPos() {
+    return this.syncEntry?.pos ?? this.body.translation();
   }
 
   _bindInput() {
@@ -65,7 +80,12 @@ export class PlayerController {
       if (e.repeat) return;
       this.keys.add(e.code);
       if (e.code === 'Space') this.jumpBuffer = 0.14;
+      if (e.code === 'KeyF') this._throwOrPunt();
     });
+    window.addEventListener('mousedown', (e) => {
+      if (e.button === 2 && document.pointerLockElement === this.ctx.renderer.domElement) this._throwOrPunt();
+    });
+    window.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
     window.addEventListener('mousemove', (e) => {
       if (document.pointerLockElement !== this.ctx.renderer.domElement) return;
@@ -85,6 +105,37 @@ export class PlayerController {
     const p = this.body.translation();
     this._fwd.set(Math.sin(this.charYaw ?? this.yaw), 0, Math.cos(this.charYaw ?? this.yaw));
     return this._anchor.set(p.x + this._fwd.x * 0.9, p.y + 0.15, p.z + this._fwd.z * 0.9);
+  }
+
+  // F / right-click: throw the carried package, or punt whatever's in front.
+  _throwOrPunt() {
+    if (this.knockTimer > 0) return;
+    const { packages } = this.ctx;
+    const dx = -Math.sin(this.yaw), dz = -Math.cos(this.yaw); // camera forward
+    if (packages.current?.carried) {
+      packages.throwCarried(dx, dz);
+      this.throwAnimT = 0.3;
+      return;
+    }
+    if (this._puntCd > 0) return;
+    const p = this.body.translation();
+    let best = null, bestD = Infinity;
+    for (const d of this.ctx.dynamics) {
+      if (d.kind === 'player') continue;
+      const bp = d.body.translation();
+      const ox = bp.x - p.x, oy = bp.y - p.y, oz = bp.z - p.z;
+      const dist = Math.hypot(ox, oy, oz);
+      if (dist > 2.0 || ox * dx + oz * dz < 0) continue; // in front only
+      if (dist < bestD) { bestD = dist; best = d; }
+    }
+    if (!best) return;
+    this._puntCd = 0.5;
+    this.throwAnimT = 0.25;
+    const m = best.body.mass();
+    best.body.applyImpulse({ x: dx * m * 7, y: m * 3.5, z: dz * m * 7 }, true);
+    const bp = best.body.translation();
+    this.ctx.particles.dust(new THREE.Vector3(bp.x, bp.y, bp.z), 1);
+    this.ctx.sfx.pop();
   }
 
   knockdown(sec) {
@@ -110,25 +161,27 @@ export class PlayerController {
     }
     this.ctx.hud.toast(pickRespawnQuip(), false);
     this.ctx.sfx.fail();
+    this.ctx.deliveries?.breakChain('respawn');
   }
 
   _groundCheck() {
     const { physics } = this.ctx;
-    const R = physics.RAPIER;
     const p = this.body.translation();
-    const shape = new R.Ball(0.3);
+    // targetDistance 0.02 (contact skin), maxToi 0.42 — the old 0.42/0.42 made
+    // "grounded" trip up to 0.8 m above the surface. filterGroups mirrors the
+    // capsule's own groups so the carried package (group 0x0004) is never
+    // mistaken for ground (scene queries ignore collider groups otherwise).
     const hit = physics.world.castShape(
       { x: p.x, y: p.y - 0.55, z: p.z },
       { x: 0, y: 0, z: 0, w: 1 },
       { x: 0, y: -1, z: 0 },
-      shape, 0.42, 0.42, true, undefined, undefined, undefined, this.body,
+      this._groundBall, 0.02, 0.42, true, undefined, (0x0002 << 16) | 0xfffb, undefined, this.body,
     );
     this.grounded = !!hit;
     this.groundIsTerrain = !!hit && hit.collider.handle === this.ctx.terrain.collider.handle;
     this.groundVel = { x: 0, y: 0, z: 0 };
     if (this.grounded) {
       this.coyote = 0.13;
-      this.airborneBySomethingFun = false;
       // Moving ground (gondolas, elevators, islands): ride along with it.
       const gb = hit.collider.parent();
       if (gb && !gb.isFixed()) this.groundVel = gb.linvel();
@@ -144,10 +197,31 @@ export class PlayerController {
     this.coyote = Math.max(0, this.coyote - dt);
     this.jumpBuffer = Math.max(0, this.jumpBuffer - dt);
     this.knockTimer = Math.max(0, this.knockTimer - dt);
+    this.rollTimer = Math.max(0, this.rollTimer - dt);
+    this._puntCd = Math.max(0, this._puntCd - dt);
+    this._slideCd = Math.max(0, this._slideCd - dt);
+    this.throwAnimT = Math.max(0, (this.throwAnimT ?? 0) - dt);
 
     const zone = zoneAt(p.y);
     this.onIce = this.grounded && this.groundIsTerrain && zone.key === 'frozen';
-    this.collider.setFriction(this.onIce ? 0.01 : 0.15);
+
+    // --- Belly slide: hold C while moving to toboggan on your stomach ---
+    const hSpeedNow = Math.hypot(v.x, v.z);
+    const wantSlide = this.keys.has('KeyC') && this.knockTimer <= 0;
+    if (!this.slide && wantSlide && this.grounded && hSpeedNow > 5 && this._slideCd <= 0) {
+      this.slide = true;
+      const dl = hSpeedNow || 1;
+      this.body.applyImpulse({ x: (v.x / dl) * this.body.mass() * 3, y: 0, z: (v.z / dl) * this.body.mass() * 3 }, true);
+      sfx.whooshParachute();
+      this.ctx.particles.dust(new THREE.Vector3(p.x, p.y - 0.8, p.z), 1.2);
+    }
+    // Ends on release, when we bog down, or when the parachute takes over —
+    // sliding off a ledge briefly airborne is fine and keeps the flow.
+    if (this.slide && (!wantSlide || this.parachute || (this.grounded && hSpeedNow < 2.5))) {
+      this.slide = false;
+      this._slideCd = 0.6;
+    }
+    this.collider.setFriction(this.onIce || this.slide ? 0.01 : 0.15);
 
     // --- Input direction, camera-relative ---
     let ix = 0, iz = 0;
@@ -174,7 +248,9 @@ export class PlayerController {
     const wantX = (hasInput ? dx * speed : 0) + this.groundVel.x;
     const wantZ = (hasInput ? dz * speed : 0) + this.groundVel.z;
     let gain;
-    if (this.onIce) gain = hasInput ? 2.2 : 0.4;         // skating rink
+    if (this.slide && !this.grounded) gain = 2.6;         // airborne: normal air control
+    else if (this.slide) gain = hasInput ? 1.5 : 0.25;    // steer, don't brake
+    else if (this.onIce) gain = hasInput ? 2.2 : 0.4;     // skating rink
     else if (this.grounded) gain = hasInput ? 14 : 10;
     else gain = 2.6;                                      // air control
     if (this.knockTimer > 0) gain *= 0.15;
@@ -183,9 +259,14 @@ export class PlayerController {
     this.body.applyImpulse({ x: (wantX - v.x) * m * k, y: 0, z: (wantZ - v.z) * m * k }, true);
 
     // --- Jump (with buffer + coyote time) ---
-    if (this.jumpBuffer > 0 && this.coyote > 0 && this.knockTimer <= 0) {
+    // On a hard-landing frame the buffered Space belongs to the recovery
+    // roll (below), not to an instant re-jump — otherwise the roll is
+    // unreachable: coyote refreshes the moment we touch down.
+    const hardLandingNow = this.grounded && this._wasAirborne && this._lastVy < -17 && !this.airborneBySomethingFun;
+    if (this.jumpBuffer > 0 && this.coyote > 0 && this.knockTimer <= 0 && !hardLandingNow) {
       this.jumpBuffer = 0;
       this.coyote = 0;
+      this.slide = false;
       const jumpV = JUMP * (1 / (1 + carryMass / 90));
       this.body.setLinvel({ x: v.x, y: Math.max(v.y, jumpV), z: v.z }, true);
       sfx.jump();
@@ -214,8 +295,12 @@ export class PlayerController {
     }
 
     // Footsteps
-    if (this.grounded && hasInput && Math.hypot(v.x, v.z) > 2) {
+    if (this.grounded && hasInput && !this.slide && Math.hypot(v.x, v.z) > 2) {
       sfx.footstep(zone.key === 'frozen' || zone.key === 'summit' ? 'snow' : zone.key === 'cliffs' ? 'rock' : 'grass');
+    }
+    // Slide scrape: snow spray behind the toboggan.
+    if (this.slide && this.grounded && Math.hypot(v.x, v.z) > 4 && Math.random() < dt * 18) {
+      this.ctx.particles.dust(new THREE.Vector3(p.x, p.y - 0.85, p.z), 0.7);
     }
 
     // Landing dust + thud + real fall damage
@@ -223,14 +308,28 @@ export class PlayerController {
       sfx.thud(Math.min(-this._lastVy / 16, 1.6));
       this.ctx.particles.dust(new THREE.Vector3(p.x, p.y - 0.9, p.z), Math.min(-this._lastVy / 10, 2.4));
       this.ctx.shake?.(Math.min(-this._lastVy / 40, 0.6));
-      if (this._lastVy < -17) {
-        // Bone-rattler: knockdown, and the cargo feels it too.
-        this.knockdown(0.9);
-        const pkg = this.ctx.packages.current;
-        if (pkg && pkg.def.fragile) this.ctx.packages.damage(pkg, (-this._lastVy - 17) * 1.8);
-        this.ctx.hud.toast('🦴 That landing had consequences.', true);
+      if (this._lastVy < -17 && !this.airborneBySomethingFun) {
+        if (this.jumpBuffer > 0) {
+          // RECOVERY ROLL: Space just before touchdown converts the crash
+          // into a shoulder roll — no knockdown, no cargo damage, keep speed.
+          this.jumpBuffer = 0;
+          this.rollTimer = 0.45;
+          this.knockTimer = 0; // the roll absorbs any same-tick contact hit
+          const hs = Math.hypot(v.x, v.z) || 1;
+          this.body.applyImpulse({ x: (v.x / hs) * m * 2.5, y: 0, z: (v.z / hs) * m * 2.5 }, true);
+          sfx.whooshParachute();
+          this.ctx.shake?.(0.18);
+          this.ctx.hud.toast('🌀 ROLLED IT!', true);
+        } else {
+          // Bone-rattler: knockdown, and the cargo feels it too.
+          this.knockdown(0.9);
+          const pkg = this.ctx.packages.current;
+          if (pkg && pkg.def.fragile) this.ctx.packages.damage(pkg, (-this._lastVy - 17) * 1.8);
+          this.ctx.hud.toast('🦴 That landing had consequences.', true);
+        }
       }
     }
+    if (this.grounded) this.airborneBySomethingFun = false; // after the landing branch read it
     this._wasAirborne = !this.grounded;
     this._lastVy = v.y;
 
@@ -241,7 +340,7 @@ export class PlayerController {
   // Camera + character facing run at render rate.
   update(dt) {
     const { camera, physics } = this.ctx;
-    const p = this.body.translation();
+    const p = this.renderPos();
     const v = this.body.linvel();
 
     // Face movement direction (or camera direction when idle-carrying).
@@ -262,8 +361,9 @@ export class PlayerController {
     const dir = this._camPos.clone().sub(this._camTarget);
     const len = dir.length();
     dir.normalize();
-    const ray = new physics.RAPIER.Ray(this._camTarget, dir);
-    const hit = physics.world.castRay(ray, len, true, undefined, undefined, undefined, this.body);
+    this._camRay.origin = this._camTarget;
+    this._camRay.dir = dir;
+    const hit = physics.world.castRay(this._camRay, len, true, undefined, (0x0002 << 16) | 0xfffb, undefined, this.body);
     const dist = hit ? Math.max(hit.timeOfImpact - 0.35, 0.8) : len;
     this._camPos.copy(this._camTarget).addScaledVector(dir, dist);
     camera.position.lerp(this._camPos, Math.min(dt * 14, 1));

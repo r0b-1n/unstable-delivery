@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { disposeObject } from '../core/physics.js';
+import { KILL_Y } from '../world/terrain.js';
 
 // The cargo escalation ladder. windMult = how much the wind bullies it,
 // fragile = damage multiplier, carryK = spring stiffness scale.
@@ -49,10 +51,28 @@ export class Packages {
   constructor(ctx) {
     this.ctx = ctx;
     this.current = null;      // active package instance
+    this.escapee = null;      // a sheep on the run
     this.slipCount = 0;
     this._tmpV = new THREE.Vector3();
-    this._prevVel = new THREE.Vector3();
     this._buildChute();
+    this.rollNext(0);
+  }
+
+  // Decide the NEXT package ahead of time so the depot preview can show it
+  // (and glow gold for insured cargo).
+  rollNext(n) {
+    let def = this.typeForDelivery(n);
+    if (n >= PACKAGE_TYPES.length && ((n - PACKAGE_TYPES.length) % 4 === 3 || Math.random() < 0.12)) {
+      def = {
+        ...def, golden: true, name: `Golden ${def.name}`,
+        note: `${def.note} Insured for a fortune.`,
+        warning: 'GOLDEN — ×3 PAY. DESTRUCTION COSTS 300.',
+      };
+    }
+    this.nextDef = def;
+    const m = this.preview.material;
+    if (def.golden) { m.color.set(0xffd166); m.emissive.set(0xcf8f1e); m.emissiveIntensity = 1.0; }
+    else { m.color.set(0xa9743f); m.emissive.set(0x553311); m.emissiveIntensity = 0.4; }
   }
 
   _buildChute() {
@@ -132,11 +152,12 @@ export class Packages {
       case 'balloon': {
         add(new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.7, 0.9), std(0xc98b4e)));
         const colors = [0xff4d6d, 0xffd166, 0x4dd0ff, 0x45d17a];
-        this._balloons = [];
         for (let i = 0; i < 4; i++) {
           const b = add(new THREE.Mesh(new THREE.SphereGeometry(0.34, 7, 5), std(colors[i], { roughness: 0.35 })));
           b.position.set(Math.cos(i * 1.9) * 0.35, 1.5 + (i % 2) * 0.4, Math.sin(i * 1.9) * 0.35);
           b.scale.y = 1.2;
+          b.userData.bobY = b.position.y;
+          b.userData.ph = i * 1.9;
           const str = add(new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 1.2, 3), std(0xdddddd)));
           str.position.set(b.position.x * 0.6, 0.8, b.position.z * 0.6);
           str.lookAt(b.position);
@@ -185,25 +206,39 @@ export class Packages {
         break;
       }
       case 'ghost': {
-        const box = add(new THREE.Mesh(new THREE.BoxGeometry(1.0, 1.0, 1.0), std(0xcfe3ff, { transparent: true, opacity: 0.55, emissive: 0x88aaff, emissiveIntensity: 0.35 })));
+        // Inner group so the flip-tumble can rotate visibly — syncMeshes
+        // overwrites the root group's quaternion from the physics body.
+        const inner = new THREE.Group();
+        const box = new THREE.Mesh(new THREE.BoxGeometry(1.0, 1.0, 1.0), std(0xcfe3ff, { transparent: true, opacity: 0.55, emissive: 0x88aaff, emissiveIntensity: 0.35 }));
         box.rotation.y = 0.3;
-        const eL = add(new THREE.Mesh(new THREE.SphereGeometry(0.09, 5, 4), std(0x222244)));
+        box.castShadow = true;
+        const eL = new THREE.Mesh(new THREE.SphereGeometry(0.09, 5, 4), std(0x222244));
         eL.position.set(-0.2, 0.15, 0.51);
         const eR = eL.clone();
         eR.position.x = 0.2;
-        g.add(eR);
+        inner.add(box, eL, eR);
+        g.add(inner);
+        g.userData.inner = inner;
         break;
       }
     }
     return g;
   }
 
-  spawn(def) {
+  spawn(def, at = null) {
     const { physics, scene } = this.ctx;
     const R = physics.RAPIER;
     const mesh = this._buildMesh(def);
+    if (def.golden) {
+      mesh.traverse((o) => {
+        if (o.material?.color) {
+          o.material.color.lerp(new THREE.Color(0xffd166), 0.45);
+          if (o.material.emissive) { o.material.emissive.set(0xcf8f1e); o.material.emissiveIntensity = 0.5; }
+        }
+      });
+    }
     scene.add(mesh);
-    const pos = { x: this.chutePos.x, y: this.chutePos.y + 3.2, z: this.chutePos.z };
+    const pos = at ?? { x: this.chutePos.x, y: this.chutePos.y + 3.2, z: this.chutePos.z };
     const shape = def.id === 'egg' || def.id === 'potion'
       ? R.ColliderDesc.ball(0.62)
       : R.ColliderDesc.cuboid(0.55, 0.55, 0.55);
@@ -222,6 +257,13 @@ export class Packages {
       condition: 100, shake: 0, carried: false,
       timer: 0, ghostPhase: 0, ghostFlip: 0, delivered: false,
       spawnTime: performance.now(),
+      grace: 0.9,        // impact + shake immunity right after spawning
+      dmgCd: 0,          // impact-damage cooldown (60 Hz contact streams!)
+      noGrabT: 0,        // can't re-grab a just-thrown package
+      thrownT: 0,        // a thrown package can still score a delivery
+      squash: 0,
+      prevVel: new THREE.Vector3(),
+      heartT: 0,
     };
     physics.onContactForce(collider, (other, mag) => this._onImpact(pkg, mag));
     this.ctx.registerDynamic(body, 'package');
@@ -230,13 +272,19 @@ export class Packages {
   }
 
   _onImpact(pkg, mag) {
-    if (pkg.delivered || !pkg.def.fragile) return;
+    if (pkg.delivered) return;
     // Convert contact force to an approximate deltaV so damage is
     // mass-independent: gentle bumps are free, real slams hurt.
     const dv = (mag / 60) / pkg.def.mass;
+    if (dv > 3) pkg.squash = Math.max(pkg.squash, Math.min(dv / 14, 1));
+    if (!pkg.def.fragile) return;
+    // Grace right after spawn (the chute drop is free) and a short cooldown
+    // so a sustained 60 Hz contact stream can't shred the parcel in frames.
+    if (pkg.grace > 0 || pkg.dmgCd > 0) return;
     if (dv < 6) return;
     const dmg = Math.min((dv - 6) * pkg.def.fragile * 4.5, 45);
     if (dmg < 1.5) return;
+    pkg.dmgCd = 0.3;
     this.damage(pkg, dmg);
   }
 
@@ -265,14 +313,15 @@ export class Packages {
         o.material.color.copy(o.userData.baseColor).multiplyScalar(0.45 + 0.55 * k);
       }
     });
-    pkg.mesh.scale.setScalar(0.9 + 0.1 * k);
     if (pkg.condition <= 0) this.break(pkg);
   }
 
   break(pkg, exploded = false) {
     const { sfx, particles, hud, deliveries } = this.ctx;
+    if (pkg.def.id === 'sheep' && !exploded) return this._sheepEscape(pkg);
     const p = pkg.body.translation();
     this._tmpV.set(p.x, p.y, p.z);
+    this.ctx.hitstop?.(exploded ? 0.12 : 0.08);
     if (exploded) {
       particles.explosion(this._tmpV);
       sfx.explosion();
@@ -282,11 +331,121 @@ export class Packages {
       particles.shards(this._tmpV, pkg.def.id === 'porcelain' ? 0xf0ead6 : 0xa9743f);
       sfx.shatter();
     }
+    const golden = !!pkg.def.golden;
     this.remove(pkg);
     hud.toast(exploded ? '💥 THE POTION WENT OFF' : '📦 PACKAGE DESTROYED', false);
     hud.toast('A replacement is at the depot. It comes out of your pay.', true);
     sfx.fail();
-    deliveries.onPackageLost();
+    deliveries.onPackageLost(golden);
+  }
+
+  // The crate breaks but the sheep survives — and runs. Catch her to re-crate.
+  _sheepEscape(pkg) {
+    const { sfx, particles, hud, physics, scene } = this.ctx;
+    const p = pkg.body.translation();
+    this._tmpV.set(p.x, p.y, p.z);
+    particles.shards(this._tmpV, 0xa9743f);
+    sfx.shatter();
+    sfx.baa();
+    const def = pkg.def;
+    this.remove(pkg);
+
+    const g = new THREE.Group();
+    const wool = new THREE.Mesh(new THREE.IcosahedronGeometry(0.42, 0), new THREE.MeshStandardMaterial({ color: 0xf5f0e6, flatShading: true, roughness: 1 }));
+    const face = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshStandardMaterial({ color: 0x2b2b2b, flatShading: true }));
+    face.position.set(0, 0.05, 0.38);
+    const legMat = new THREE.MeshStandardMaterial({ color: 0x2b2b2b, flatShading: true });
+    for (const [lx, lz] of [[-0.2, -0.15], [0.2, -0.15], [-0.2, 0.2], [0.2, 0.2]]) {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.3, 4), legMat);
+      leg.position.set(lx, -0.42, lz);
+      g.add(leg);
+    }
+    g.add(wool, face);
+    g.traverse((o) => { o.castShadow = true; });
+    scene.add(g);
+    const R = physics.RAPIER;
+    const { body } = physics.addDynamic(g, R.ColliderDesc.ball(0.45).setFriction(0.9), {
+      pos: { x: p.x, y: p.y + 0.5, z: p.z }, mass: 12, angularDamping: 3,
+    });
+    this.ctx.registerDynamic(body, 'sheep');
+    this.escapee = { def, body, mesh: g, ttl: 22, hopT: 0.2 };
+    hud.toast('🐑 THE SHEEP IS LOOSE! Catch her!', false);
+    hud.setPackage(null);
+  }
+
+  _removeEscapee() {
+    const e = this.escapee;
+    if (!e) return;
+    this.ctx.unregisterDynamic(e.body);
+    this.ctx.physics.removeBody(e.body);
+    this.ctx.scene.remove(e.mesh);
+    disposeObject(e.mesh, true);
+    this.escapee = null;
+  }
+
+  _tickEscapee(dt) {
+    const e = this.escapee;
+    const { player, particles, sfx, hud } = this.ctx;
+    e.ttl -= dt;
+    const p = e.body.translation();
+    const pp = player.body.translation();
+    const dx = p.x - pp.x, dz = p.z - pp.z;
+    const d = Math.hypot(dx, dz, p.y - pp.y);
+    e.hopT -= dt;
+    if (e.hopT <= 0) {
+      e.hopT = 0.45 + Math.random() * 0.4;
+      // Flee the courier; wander once she feels safe.
+      let ax, az;
+      if (d < 26) { const l = Math.hypot(dx, dz) || 1; ax = dx / l; az = dz / l; }
+      else { const a = Math.random() * Math.PI * 2; ax = Math.cos(a); az = Math.sin(a); }
+      const m = e.body.mass();
+      e.body.applyImpulse({ x: (ax + (Math.random() - 0.5) * 0.7) * m * 4, y: m * 3.2, z: (az + (Math.random() - 0.5) * 0.7) * m * 4 }, true);
+      if (Math.random() < 0.35 && d < 50) sfx.baa();
+      this._tmpV.set(p.x, p.y - 0.3, p.z);
+      particles.dust(this._tmpV, 0.5);
+    }
+    if (d < 1.8 && player.knockTimer <= 0) {
+      // Caught! Back in the crate (a very dented crate).
+      this._removeEscapee();
+      const pkg = this.spawn(e.def, { x: pp.x, y: pp.y + 1.5, z: pp.z });
+      pkg.carried = true;
+      pkg.condition = 40;
+      hud.setPackage(e.def.name, e.def.note, false);
+      hud.setCondition(40);
+      hud.toast('🐑 RECAPTURED! She is not happy about it.', false);
+      sfx.baa();
+      sfx.pickup();
+      return;
+    }
+    if (e.ttl <= 0 || p.y < KILL_Y) {
+      this._tmpV.set(p.x, p.y, p.z);
+      if (e.ttl <= 0) particles.dust(this._tmpV, 1);
+      this._removeEscapee();
+      hud.toast('🐑 The sheep has formally resigned.', false);
+      hud.toast('A replacement is at the depot. It comes out of your pay.', true);
+      this.ctx.sfx.fail();
+      this.ctx.deliveries.onPackageLost(false);
+    }
+  }
+
+  // F / right-click: hurl the carried package along the camera aim.
+  throwCarried(dx, dz) {
+    const pkg = this.current;
+    if (!pkg?.carried) return;
+    const { player, sfx } = this.ctx;
+    pkg.carried = false;
+    pkg.noGrabT = 0.65;
+    pkg.thrownT = 1.8;
+    pkg.body.resetForces(true);
+    const k = Math.min(1, 16 / pkg.def.mass); // the anvil mostly just plops
+    const pv = player.body.linvel();
+    pkg.body.setLinvel({
+      x: pv.x * 0.6 + dx * 11 * k,
+      y: Math.max(pv.y, 0) * 0.3 + 5.5 * k,
+      z: pv.z * 0.6 + dz * 11 * k,
+    }, true);
+    if (pkg.def.id === 'potion') pkg.shake = Math.min(92, pkg.shake + 16);
+    sfx.throwWhoosh();
   }
 
   _blast(center) {
@@ -307,17 +466,20 @@ export class Packages {
     this.ctx.unregisterDynamic(pkg.body);
     physics.removeBody(pkg.body);
     scene.remove(pkg.mesh);
+    disposeObject(pkg.mesh, true); // package materials are per-instance
+    if (pkg.def.id === 'potion') this._liquid = null;
     if (this.current === pkg) this.current = null;
     this.ctx.hud.setPackage(null);
   }
 
   tryPickup() {
     // Called when the player walks into the depot ring with no package.
+    if (this.escapee) return; // no replacement while your sheep is at large
     const { player, hud, sfx, deliveries } = this.ctx;
     const pp = player.body.translation();
     const d = Math.hypot(pp.x - this.chutePos.x, pp.z - this.chutePos.z);
     if (d > 2.6 || Math.abs(pp.y - this.chutePos.y) > 3) return;
-    const def = this.typeForDelivery(deliveries.completed);
+    const def = this.nextDef ?? this.typeForDelivery(deliveries.completed);
     const pkg = this.spawn(def);
     pkg.carried = true;
     sfx.pickup();
@@ -334,6 +496,7 @@ export class Packages {
 
   fixedUpdate(dt, t) {
     const { player, wind, particles, sfx, hud } = this.ctx;
+    if (this.escapee) this._tickEscapee(dt);
     if (!this.current) {
       this.ring.rotation.z += dt;
       this.preview.rotation.y += dt * 1.5;
@@ -347,6 +510,10 @@ export class Packages {
     const p = body.translation();
     const v = body.linvel();
     pkg.timer += dt;
+    pkg.grace = Math.max(0, pkg.grace - dt);
+    pkg.dmgCd = Math.max(0, pkg.dmgCd - dt);
+    pkg.noGrabT = Math.max(0, pkg.noGrabT - dt);
+    pkg.thrownT = Math.max(0, pkg.thrownT - dt);
 
     // --- Carry spring: parcel is yanked toward the hand anchor; the player
     // feels the reaction, so heavy or possessed cargo genuinely hinders. ---
@@ -356,11 +523,11 @@ export class Packages {
       const dist = Math.hypot(dx, dy, dz);
       if (dist > 4) {
         // Snapped too far (stuck in geometry): teleport back to the hands.
-        // That yank absolutely counts as shaking.
+        // That yank absolutely counts as shaking — but the spawn snap is free.
         body.setTranslation({ x: anchor.x, y: anchor.y, z: anchor.z }, true);
         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-        this._prevVel.set(0, 0, 0);
-        if (def.id === 'potion') pkg.shake = Math.min(100, pkg.shake + 22);
+        pkg.prevVel.set(0, 0, 0);
+        if (def.id === 'potion' && pkg.grace <= 0) pkg.shake = Math.min(100, pkg.shake + 18);
       } else {
         const m = def.mass;
         const k = 130 * m, c = 14 * m;
@@ -380,10 +547,12 @@ export class Packages {
       }
     } else {
       body.resetForces(true);
-      // Loose package near the player: pick it back up by touching it.
+      // Loose package near the player: pick it back up by touching it
+      // (unless it was just thrown — let it fly).
       const pp = player.body.translation();
-      if (Math.hypot(pp.x - p.x, pp.y - p.y, pp.z - p.z) < 1.7 && player.knockTimer <= 0) {
+      if (pkg.noGrabT <= 0 && Math.hypot(pp.x - p.x, pp.y - p.y, pp.z - p.z) < 1.7 && player.knockTimer <= 0) {
         pkg.carried = true;
+        pkg.thrownT = 0;
         sfx.pickup();
         hud.toast('📦 Recovered!', true);
       }
@@ -407,6 +576,11 @@ export class Packages {
         }
         this._tmpV.set(p.x, p.y + 1.6, p.z);
         if (Math.random() < dt * 2) particles.sparks(this._tmpV, 0xff9fd0, 1);
+        // The balloons themselves bob on their strings.
+        pkg.balloons ??= pkg.mesh.children.filter((c) => c.userData.bobY !== undefined);
+        for (const b of pkg.balloons) {
+          b.position.y = b.userData.bobY + Math.sin(t * 2.2 + b.userData.ph) * 0.12;
+        }
         break;
       }
       case 'egg': {
@@ -445,21 +619,27 @@ export class Packages {
         break;
       }
       case 'potion': {
-        // Shake meter: integrate acceleration spikes.
-        const acc = Math.hypot(v.x - this._prevVel.x, v.y - this._prevVel.y, v.z - this._prevVel.z) / dt;
-        if (acc > 35) pkg.shake = Math.min(100, pkg.shake + (acc - 35) * dt * 0.9);
+        // Shake meter: integrate acceleration spikes (skipped during the
+        // spawn grace so the chute drop + first spring snap are free).
+        const acc = Math.hypot(v.x - pkg.prevVel.x, v.y - pkg.prevVel.y, v.z - pkg.prevVel.z) / dt;
+        if (acc > 35 && pkg.grace <= 0) pkg.shake = Math.min(100, pkg.shake + (acc - 35) * dt * 0.9);
         if (pkg.shake >= 100) { this.break(pkg, true); return; }
         pkg.shake = Math.max(0, pkg.shake - dt * 3.5);
         hud.setShake(pkg.shake);
         if (this._liquid) {
           this._liquid.material.emissiveIntensity = 0.8 + (pkg.shake / 100) * 3 * (0.6 + Math.sin(t * 20) * 0.4);
         }
+        // The flask has a heartbeat, and it accelerates. You'll feel it.
+        pkg.heartT -= dt;
+        if (pkg.shake > 50 && pkg.heartT <= 0) {
+          pkg.heartT = 1.25 - (pkg.shake / 100) * 0.85;
+          sfx.heartbeat(pkg.shake / 100);
+        }
         if (pkg.shake > 82 && Math.random() < dt * 2.5) {
           this._tmpV.set(p.x, p.y + 0.5, p.z);
           particles.sparks(this._tmpV, 0xb64fc8, 3);
           sfx.sizzle();
         }
-        if (pkg.shake >= 100) { this.break(pkg, true); return; }
         break;
       }
       case 'ghost': {
@@ -467,7 +647,7 @@ export class Packages {
         if (pkg.ghostFlip > 0) {
           pkg.ghostFlip -= dt;
           body.addForce({ x: 0, y: body.mass() * 40, z: 0 }, true); // "down" is a suggestion
-          pkg.mesh.rotation.z += dt * 3;
+          pkg.mesh.userData.inner.rotation.z += dt * 3;
           if (Math.random() < dt * 6) {
             this._tmpV.set(p.x, p.y, p.z);
             particles.sparks(this._tmpV, 0x88aaff, 2);
@@ -480,7 +660,30 @@ export class Packages {
         break;
       }
     }
-    this._prevVel.set(v.x, v.y, v.z);
+    pkg.prevVel.set(v.x, v.y, v.z);
+
+    // Squash & stretch on impacts (egg has its own pulse animation).
+    pkg.squash = Math.max(0, pkg.squash - dt * 5);
+    if (def.id !== 'egg') {
+      const s0 = 0.9 + 0.1 * (pkg.condition / 100);
+      const sq = pkg.squash * 0.3;
+      pkg.mesh.scale.set(s0 * (1 + sq), s0 * (1 - sq), s0 * (1 + sq));
+    }
+
+    // Battered fragile cargo visibly smokes; critical cargo sparks.
+    if (def.fragile && pkg.condition < 50) {
+      const crit = pkg.condition < 25;
+      if (Math.random() < dt * (crit ? 3.2 : 1.4)) {
+        this._tmpV.set(p.x, p.y + 0.4, p.z);
+        particles.smoke(this._tmpV);
+        if (crit && Math.random() < 0.4) particles.sparks(this._tmpV, 0xffb347, 2);
+      }
+    }
+    // Golden cargo glitters.
+    if (def.golden && Math.random() < dt * 5) {
+      this._tmpV.set(p.x + (Math.random() - 0.5), p.y + 0.6, p.z + (Math.random() - 0.5));
+      particles.sparks(this._tmpV, 0xffd166, 1);
+    }
 
     // Lost below the world: bring it back to the courier, dinged.
     if (p.y < -12) {

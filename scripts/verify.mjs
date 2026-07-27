@@ -219,6 +219,122 @@ for (const typeIdx of [2, 3]) { // balloon, egg
   if (fly.rise > 4) throw new Error(`Carrying ${fly.id} lifted the player ${fly.rise.toFixed(1)}m — flight exploit back`);
 }
 
+// --- Regression: parachute must deploy WHILE CARRYING a package ---
+// (the ground probe used to detect the carried parcel as "ground")
+const chuteCarry = await page.evaluate(async () => {
+  const g = window.__game;
+  if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+  const pkg = g.ctx.packages.spawn(g.ctx.packages.typeForDelivery(0));
+  pkg.carried = true;
+  const c = g.ctx.packages.chutePos;
+  g.teleport(c.x, c.y + 60, c.z);
+  await new Promise((r) => setTimeout(r, 600));
+  return { grounded: g.ctx.player.grounded, falling: g.playerVel[1] < -3 };
+});
+console.log('carry-airborne:', JSON.stringify(chuteCarry));
+if (chuteCarry.grounded) throw new Error('Grounded while falling with a carried package — ground probe hits the parcel again');
+await page.keyboard.down('Space');
+await page.waitForTimeout(1200);
+const carryChuteOn = await page.evaluate(() => window.__game.ctx.player.parachute);
+await page.keyboard.up('Space');
+console.log('parachute while carrying:', carryChuteOn);
+if (!carryChuteOn) throw new Error('Parachute refused to deploy while carrying');
+await page.waitForTimeout(2500);
+
+// --- Throw: F hurls the package; a thrown package can still deliver ---
+const throwTest = await page.evaluate(async () => {
+  const g = window.__game;
+  if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+  const b = g.ctx.deliveries.beacon.position;
+  g.teleport(b.x - 6, b.y + 2, b.z);
+  const pkg = g.ctx.packages.spawn(g.ctx.packages.typeForDelivery(0), { x: b.x - 6, y: b.y + 2, z: b.z });
+  pkg.carried = true;
+  pkg.grace = 0;
+  await new Promise((r) => setTimeout(r, 400));
+  // aim the camera yaw at the beacon: forward = (-sin yaw, -cos yaw)
+  const p = g.playerPos;
+  g.ctx.player.yaw = Math.atan2(-(b.x - p[0]), -(b.z - p[2]));
+  const before = g.completed;
+  g.ctx.packages.throwCarried(-Math.sin(g.ctx.player.yaw), -Math.cos(g.ctx.player.yaw));
+  const carriedAfter = g.ctx.packages.current?.carried;
+  await new Promise((r) => setTimeout(r, 2000));
+  return { carriedAfter, delivered: g.completed > before };
+});
+console.log('throw test:', JSON.stringify(throwTest));
+if (throwTest.carriedAfter) throw new Error('Throw did not release the package');
+if (!throwTest.delivered) throw new Error('Thrown package did not deliver (yeet-to-deliver broken)');
+
+// --- Jump-gap sanity: plank-less gaps must be physically jumpable ---
+const gaps = await page.evaluate(() => {
+  const T = window.__game.ctx.terrain.constructor.GAPS;
+  const path = (t) => window.__game.ctx.terrain.pathPoint(t);
+  return T.map((g) => {
+    const a = path(g.t - g.w), b = path(g.t + g.w);
+    return { m: g.m, actual: Math.hypot(b.x - a.x, b.z - a.z) };
+  });
+});
+console.log('gap spans:', gaps.map((g) => `${g.m}m→${g.actual.toFixed(1)}m`).join(' '));
+for (const g of gaps) if (Math.abs(g.actual - g.m) > 2) throw new Error(`Gap width off: wanted ${g.m}m got ${g.actual.toFixed(1)}m`);
+
+// --- Recovery roll: tap Space just before a hard landing → no knockdown ---
+const roll = await page.evaluate(async () => {
+  const g = window.__game;
+  if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+  const c = g.ctx.packages.chutePos;
+  const x = c.x - 8, z = c.z - 8;
+  const ground = g.ctx.terrain.heightAt(x, z);
+  g.teleport(x, ground + 24, z);
+  let tapped = false;
+  for (let i = 0; i < 400 && !tapped; i++) {
+    await new Promise((r) => setTimeout(r, 12));
+    const p = g.playerPos, v = g.playerVel;
+    if (v[1] < -15 && p[1] - ground < 4) {
+      // tap, don't hold — holding would deploy the parachute instead
+      window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space' }));
+      window.dispatchEvent(new KeyboardEvent('keyup', { code: 'Space' }));
+      tapped = true;
+    }
+  }
+  let rolled = false, knocked = false;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 20));
+    rolled ||= g.ctx.player.rollTimer > 0;
+    knocked ||= g.ctx.player.knockTimer > 0.3;
+  }
+  return { tapped, rolled, knocked };
+});
+console.log('recovery roll:', JSON.stringify(roll));
+if (!roll.tapped) throw new Error('Roll test never reached the tap window');
+if (!roll.rolled) throw new Error('Recovery roll did not trigger on a pre-landing Space tap');
+if (roll.knocked) throw new Error('Recovery roll still caused a knockdown');
+
+// --- Sheep escape: breaking the crate frees the sheep; catching re-crates ---
+const sheepTest = await page.evaluate(async () => {
+  const g = window.__game;
+  if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+  const def = g.ctx.packages.typeForDelivery(4); // sheep
+  const pkg = g.ctx.packages.spawn(def);
+  pkg.carried = true;
+  await new Promise((r) => setTimeout(r, 300));
+  g.ctx.packages.break(pkg);
+  const escaped = !!g.ctx.packages.escapee && !g.ctx.packages.current;
+  // chase her down by teleporting onto her
+  let caught = false;
+  for (let i = 0; i < 20 && !caught; i++) {
+    const e = g.ctx.packages.escapee;
+    if (!e) break;
+    const ep = e.body.translation();
+    g.teleport(ep.x, ep.y + 0.5, ep.z);
+    await new Promise((r) => setTimeout(r, 150));
+    caught = !!g.ctx.packages.current;
+  }
+  if (g.ctx.packages.current) g.ctx.packages.remove(g.ctx.packages.current);
+  return { escaped, caught };
+});
+console.log('sheep escape:', JSON.stringify(sheepTest));
+if (!sheepTest.escaped) throw new Error('Sheep crate break did not spawn an escapee');
+if (!sheepTest.caught) throw new Error('Could not recapture the escaped sheep');
+
 // --- Character rig sanity: parts exist and run cycle actually rotates the legs ---
 const rig = await page.evaluate(async () => {
   const ch = window.__game.ctx.character;

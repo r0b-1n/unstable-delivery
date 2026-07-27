@@ -71,6 +71,9 @@ export class Music {
   _schedule() {
     if (!this.playing || !this.enabled) { this._catchUp(); return; }
     const stepDur = 60 / this.bpm / 2; // 8th notes
+    // Tab was throttled: skip the missed steps instead of dumping them all
+    // into a single simultaneous chord blast.
+    if (this.ctx.currentTime - this._nextTime > 0.4) this._catchUp();
     while (this._nextTime < this.ctx.currentTime + 0.25) {
       this._playStep(this._step, this._nextTime, stepDur);
       this._step = (this._step + 1) % 32;

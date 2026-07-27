@@ -15,6 +15,8 @@ export class Props {
     this.rollers = [];
     this._rollTimer = 5;
     this._tmp = new THREE.Vector3();
+    this.boingCombo = 0;    // chained launches without settling on the ground
+    this._groundT = 0;
     this._build();
   }
 
@@ -241,7 +243,13 @@ export class Props {
     );
     ful.position.set(pos.x, pos.y + 0.7, pos.z);
     scene.add(ful);
-    const fulBody = physics.world.createRigidBody(R.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y + 0.7, pos.z));
+    // The revolute axis is interpreted in BOTH bodies' local frames, so the
+    // fulcrum must carry the same yaw as the plank or the hinge fights itself.
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -angle);
+    const fulBody = physics.world.createRigidBody(
+      R.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y + 0.7, pos.z)
+        .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }),
+    );
     physics.world.createCollider(R.ColliderDesc.cone(0.7, 0.8), fulBody);
 
     // Dynamic plank on a revolute joint
@@ -256,9 +264,9 @@ export class Props {
       R.ColliderDesc.cuboid(3.75, 0.15, 0.85).setFriction(0.9),
       { pos: { x: pos.x, y: pos.y + 1.55, z: pos.z }, mass: 22, angularDamping: 0.6 },
     );
-    body.setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -angle), true);
-    const axis = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle));
-    const params = R.JointData.revolute({ x: 0, y: 0, z: 0 }, { x: 0, y: -0.85, z: 0 }, axis);
+    body.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+    // Shared local frame → hinge across the plank's length is local Z.
+    const params = R.JointData.revolute({ x: 0, y: 0, z: 0 }, { x: 0, y: -0.85, z: 0 }, { x: 0, y: 0, z: 1 });
     physics.world.createImpulseJoint(params, fulBody, body, true);
     this.seesaws.push(body);
   }
@@ -301,23 +309,46 @@ export class Props {
   fixedUpdate(dt, t) {
     const { dynamics, particles, sfx, player } = this.ctx;
 
+    // Boing-combo bookkeeping: settle on real ground for a beat → reset.
+    const ppc = player.body.translation();
+    if (player.grounded && player.groundIsTerrain) this._groundT += dt;
+    else this._groundT = 0;
+    if (this._groundT > 0.9) this.boingCombo = 0;
+
     // Mushroom bounce: anything falling onto a cap gets launched.
     for (const m of this.mushrooms) {
       m.squish = Math.max(0, m.squish - dt * 4);
+      m.cool = Math.max(0, (m.cool ?? 0) - dt);
       m.group.scale.y = 1 - m.squish * 0.35;
       for (const d of dynamics) {
         const p = d.body.translation();
         const dx = p.x - m.pos.x, dz = p.z - m.pos.z;
         if (dx * dx + dz * dz > m.r * m.r) continue;
         const v = d.body.linvel();
-        if (v.y < -1 && p.y > m.capY - 0.6 && p.y < m.capY + 1.6) {
-          const launch = 17 + Math.min(-v.y * 0.35, 9);
+        if (v.y < -1 && p.y > m.capY - 0.6 && p.y < m.capY + 1.6 && m.cool <= 0) {
+          m.cool = 0.3;
+          const isPlayer = d.kind === 'player';
+          let launch = 17 + Math.min(-v.y * 0.35, 9);
+          let pitch = 1;
+          if (isPlayer) {
+            // Chained boings launch higher and squeak higher.
+            this.boingCombo++;
+            this._groundT = 0;
+            launch *= 1 + 0.1 * Math.min(this.boingCombo - 1, 5);
+            pitch = 1 + 0.13 * Math.min(this.boingCombo - 1, 6);
+            player.airborneBySomethingFun = true;
+            player.lastLaunchT = t;
+            if (this.boingCombo >= 3) {
+              this.ctx.deliveries.addBonus(10 * this.boingCombo, `🍄 BOING ×${this.boingCombo}`);
+            }
+          }
           d.body.setLinvel({ x: v.x * 0.8, y: launch, z: v.z * 0.8 }, true);
           m.squish = 1;
           this._tmp.set(p.x, m.capY, p.z);
           particles.pops(this._tmp, 0xff5d5d);
-          sfx.boing();
-          if (d.kind === 'player') player.airborneBySomethingFun = true;
+          // Unattended debris bouncing three loops away must not spam audio.
+          const dp = Math.hypot(ppc.x - m.pos.x, ppc.y - m.pos.y, ppc.z - m.pos.z);
+          if (dp < 45) sfx.boing(pitch);
         }
       }
     }
@@ -329,20 +360,26 @@ export class Props {
       if (g.active > 0) {
         this._tmp.set(g.pos.x + (Math.random() - 0.5), g.pos.y + 1, g.pos.z + (Math.random() - 0.5));
         particles.steam(this._tmp, 1 + g.active);
-        if (cycle < dt * 2) {
-          const pp = player.body.translation();
-          const dist = Math.hypot(pp.x - g.pos.x, pp.z - g.pos.z);
+        if (cycle < dt) { // exactly one tick per eruption
+          const dist = Math.hypot(ppc.x - g.pos.x, ppc.z - g.pos.z);
           if (dist < 40) sfx.geyser();
         }
         for (const d of dynamics) {
           const p = d.body.translation();
           const dx = p.x - g.pos.x, dz = p.z - g.pos.z;
           const dy = p.y - g.pos.y;
-          if (dx * dx + dz * dz < 6.5 && dy > -1 && dy < 16) {
+          const isPlayer = d.kind === 'player';
+          // Parachute = thermal glider: the steam grips it harder, higher.
+          const chute = isPlayer && player.parachute;
+          const reach = chute ? 30 : 16;
+          if (dx * dx + dz * dz < 6.5 && dy > -1 && dy < reach) {
             const m = d.body.mass();
-            const falloff = 1 - dy / 18;
-            d.body.applyImpulse({ x: 0, y: m * 60 * g.active * falloff * dt, z: 0 }, true);
-            if (d.kind === 'player') player.airborneBySomethingFun = true;
+            const falloff = 1 - dy / (reach + 2);
+            d.body.applyImpulse({ x: 0, y: m * 60 * (chute ? 2.1 : 1) * g.active * falloff * dt, z: 0 }, true);
+            if (isPlayer) {
+              player.airborneBySomethingFun = true;
+              player.lastLaunchT = t;
+            }
           }
         }
       }
@@ -387,6 +424,11 @@ export class Props {
       } else if (pl.state === 'falling') {
         pl.respawn -= dt;
         if (pl.respawn <= 0) {
+          // Never materialize the fixed plank inside the courier.
+          if (Math.hypot(pp.x - pl.mid.x, pp.y - pl.mid.y, pp.z - pl.mid.z) < 3.5) {
+            pl.respawn = 1;
+            continue;
+          }
           pl.state = 'solid';
           this.ctx.physics.untrack(pl.body);
           pl.body.setBodyType(this.ctx.physics.RAPIER.RigidBodyType.Fixed, true);
@@ -416,6 +458,8 @@ export class Props {
         this.ctx.unregisterDynamic(r.body);
         this.ctx.physics.removeBody(r.body);
         this.ctx.scene.remove(r.mesh);
+        r.mesh.geometry.dispose();
+        r.mesh.material.dispose();
         this.rollers.splice(i, 1);
       }
     }

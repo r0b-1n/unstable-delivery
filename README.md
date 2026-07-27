@@ -28,9 +28,23 @@ Production build: `npm run build` (output in `dist/`, servable from any static h
 |---|---|
 | **WASD** | Move (camera-relative) |
 | **Shift** | Sprint |
-| **Space** | Jump — **hold in mid-air** to deploy the parcel-parachute |
+| **Space** | Jump — **hold in mid-air** to deploy the parcel-parachute, **tap just before a hard landing** to recovery-roll |
+| **F** / right-click | Throw the carried package (yeet-to-deliver counts!) — or kick whatever is in front of you |
+| **C** | Belly slide (hold while moving) — steerable toboggan, glorious downhill |
 | **Mouse** | Camera (click the window to lock the pointer) |
 | **Wheel** | Camera zoom |
+| **M** | Music on/off |
+
+## Getting paid
+
+Clean deliveries (≥90 % condition) build an **On-a-Roll chain** — up to ×3 on
+everything. Grazing boulders pays **close-call bonuses**, carrying through a
+storm accrues **hazard pay**, delivering airborne (parachute, fresh mushroom
+launch, or a well-aimed throw) stamps the parcel **AIRMAIL +75**, and chained
+mushroom bounces pay **BOING combos**. After the cargo ladder is exhausted,
+watch for the depot preview glowing gold: **golden packages** pay ×3 — and
+cost 300 if you destroy them. Break the sheep's crate and she *escapes*;
+catch her before she resigns.
 
 Walk into the glowing ring at the depot to pick up a package. Walk into a
 dropped package to pick it back up. Carry it into the beacon to deliver.

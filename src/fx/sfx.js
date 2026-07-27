@@ -9,6 +9,7 @@ export class Sfx {
     this.enabled = false;
     this._lastStep = 0;
     this._lastThud = 0;
+    this._lastCrack = 0;
   }
 
   // Must be called from a user gesture.
@@ -20,7 +21,29 @@ export class Sfx {
     this.master.gain.value = 0.55;
     this.master.connect(this.ctx.destination);
     this._buildWind();
+    this._buildRush();
     this.enabled = true;
+  }
+
+  // Airspeed rush: a second persistent noise loop that swells with velocity.
+  _buildRush() {
+    const src = this.ctx.createBufferSource();
+    src.buffer = this._noiseBuffer(3);
+    src.loop = true;
+    this.rushFilter = this.ctx.createBiquadFilter();
+    this.rushFilter.type = 'highpass';
+    this.rushFilter.frequency.value = 900;
+    this.rushGain = this.ctx.createGain();
+    this.rushGain.gain.value = 0.0;
+    src.connect(this.rushFilter).connect(this.rushGain).connect(this.master);
+    src.start();
+  }
+
+  setRush(v01) {
+    if (!this.enabled) return;
+    const t = this.ctx.currentTime;
+    this.rushGain.gain.setTargetAtTime(Math.min(v01, 1) * 0.09, t, 0.15);
+    this.rushFilter.frequency.setTargetAtTime(900 + v01 * 1600, t, 0.2);
   }
 
   _noiseBuffer(seconds = 2) {
@@ -116,9 +139,27 @@ export class Sfx {
     this.noise({ freq: 700, peak: 0.05, decay: 0.06 });
   }
 
-  boing() {
-    this.tone({ freq: 160, type: 'square', peak: 0.16, decay: 0.32, slideTo: 620 });
-    this.tone({ freq: 80, type: 'sine', peak: 0.2, decay: 0.2, slideTo: 300 });
+  // pitch > 1 for boing-combo chains: each bounce squeaks a step higher.
+  boing(pitch = 1) {
+    this.tone({ freq: 160 * pitch, type: 'square', peak: 0.16, decay: 0.32, slideTo: 620 * pitch });
+    this.tone({ freq: 80 * pitch, type: 'sine', peak: 0.2, decay: 0.2, slideTo: 300 * pitch });
+  }
+
+  whoosh() {
+    this.noise({ freq: 900, q: 1.6, peak: 0.2, attack: 0.03, decay: 0.28, type: 'bandpass' });
+  }
+
+  throwWhoosh() {
+    this.noise({ freq: 1500, q: 2, peak: 0.14, attack: 0.02, decay: 0.22, type: 'bandpass' });
+    this.tone({ freq: 240, type: 'triangle', peak: 0.06, decay: 0.12, slideTo: 420 });
+  }
+
+  // Two low thumps — the potion's pulse. intensity 0..1 speeds nothing here,
+  // callers control the interval; it just gets louder and tighter.
+  heartbeat(intensity = 0.5) {
+    const peak = 0.1 + intensity * 0.14;
+    this.tone({ freq: 62, type: 'sine', peak, attack: 0.01, decay: 0.12, slideTo: 40 });
+    this.tone({ freq: 58, type: 'sine', peak: peak * 0.8, attack: 0.01, decay: 0.1, slideTo: 38, delay: 0.17 });
   }
 
   whooshParachute() {
@@ -126,6 +167,9 @@ export class Sfx {
   }
 
   crack(severity = 1) {
+    const now = performance.now();
+    if (now - this._lastCrack < 80) return;
+    this._lastCrack = now;
     this.noise({ freq: 2800, peak: 0.22 * severity, decay: 0.08, type: 'highpass' });
     this.tone({ freq: 1200, type: 'triangle', peak: 0.1 * severity, decay: 0.06, slideTo: 500 });
   }

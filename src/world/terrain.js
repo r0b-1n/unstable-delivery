@@ -42,6 +42,7 @@ export class Terrain {
   constructor(ctx) {
     this.ctx = ctx;
     this.islands = [];
+    this._computeGapWidths();
     this._buildPath();
     this._buildMesh();
     this._buildCollider();
@@ -61,17 +62,36 @@ export class Terrain {
   }
 
   // Chasms cut across the trail in the upper zones — jump them, ride a
-  // mushroom out of them, or trust a crumbling plank.
+  // mushroom out of them, or trust a crumbling plank. `m` is the physical
+  // gap length in meters; every third gap (index 2, 5) is plank-less and
+  // sized to be sprint-jumpable. The t-space half-width `w` is derived from
+  // the local path speed at construction — a fixed t-width would make gaps
+  // WIDER near the base (large spiral radius) and trivial near the summit.
   static GAPS = [
-    { t: 0.415, w: 0.0035 },
-    { t: 0.505, w: 0.004 },
-    { t: 0.585, w: 0.0045 },
-    { t: 0.665, w: 0.004 },
-    { t: 0.735, w: 0.005 },
-    { t: 0.805, w: 0.0045 },
-    { t: 0.875, w: 0.0055 },
-    { t: 0.94, w: 0.005 },
+    { t: 0.415, m: 6 },
+    { t: 0.505, m: 6.5 },
+    { t: 0.585, m: 5 },
+    { t: 0.665, m: 7 },
+    { t: 0.735, m: 7.5 },
+    { t: 0.805, m: 5.5 },
+    { t: 0.875, m: 8 },
+    { t: 0.94, m: 8.5 },
   ];
+
+  _computeGapWidths() {
+    const xz = (t) => {
+      const angle = t * LOOPS * Math.PI * 2 + 0.8;
+      const radius = 196 - Math.pow(t, 0.95) * 178;
+      return [Math.cos(angle) * radius, Math.sin(angle) * radius];
+    };
+    for (const g of Terrain.GAPS) {
+      const e = 0.001;
+      const [x0, z0] = xz(g.t - e);
+      const [x1, z1] = xz(g.t + e);
+      const speed = Math.hypot(x1 - x0, z1 - z0) / (2 * e); // meters per t
+      g.w = (g.m / 2) / speed;
+    }
+  }
 
   gapAt(t) {
     for (const g of Terrain.GAPS) if (Math.abs(t - g.t) < g.w) return g;
@@ -86,14 +106,26 @@ export class Terrain {
     return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius, h, t, width, angle, gap: this.gapAt(t) };
   }
 
+  // Path sample a given number of METERS further up the trail from (x, z).
+  pathAheadOf(x, z, meters) {
+    let i = this._nearestPath(x, z).i;
+    let acc = 0;
+    while (acc < meters && i < this.pathSamples.length - 1) {
+      const a = this.pathSamples[i], b = this.pathSamples[++i];
+      acc += Math.hypot(b.x - a.x, b.z - a.z);
+    }
+    return this.pathSamples[i];
+  }
+
   _nearestPath(x, z) {
-    let best = null, bestD = Infinity;
-    for (const p of this.pathSamples) {
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < this.pathSamples.length; i++) {
+      const p = this.pathSamples[i];
       const dx = p.x - x, dz = p.z - z;
       const d = dx * dx + dz * dz;
-      if (d < bestD) { bestD = d; best = p; }
+      if (d < bestD) { bestD = d; best = i; }
     }
-    return { p: best, d: Math.sqrt(bestD) };
+    return { p: this.pathSamples[best], d: Math.sqrt(bestD), i: best };
   }
 
   _rawHeight(x, z) {

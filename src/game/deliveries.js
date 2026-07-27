@@ -16,13 +16,34 @@ export class Deliveries {
     this.ctx = ctx;
     this.completed = 0;
     this.score = 0;
+    this.chain = 0;         // consecutive clean deliveries → payout multiplier
     this.spots = [];
     this.target = null;
     this.pickupTime = 0;
     this._tmp = new THREE.Vector3();
+    this._shockT = 0;
     this._buildSpots();
     this._buildBeacon();
     this._chooseTarget();
+  }
+
+  get chainMult() {
+    return 1 + 0.5 * Math.min(this.chain, 4); // caps at ×3
+  }
+
+  breakChain(reason) {
+    if (this.chain === 0) return;
+    this.chain = 0;
+    this.ctx.hud.setChain(0);
+    this.ctx.hud.toast(`💔 Chain broken (${reason}).`, true);
+  }
+
+  // Flat bonus (close calls, hazard pay, combos) — chain-multiplied.
+  addBonus(amount, label) {
+    const gained = Math.round(amount * this.chainMult);
+    this.score += gained;
+    this.ctx.hud.setScore(this.score);
+    this.ctx.hud.scorePop([`${label} +${gained}`]);
   }
 
   _buildSpots() {
@@ -62,6 +83,13 @@ export class Deliveries {
 
   _buildBeacon() {
     const { scene } = this.ctx;
+    // Delivery shockwave: an expanding gold ring at the pad.
+    this.shock = new THREE.Mesh(
+      new THREE.TorusGeometry(1, 0.18, 6, 28),
+      new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0, depthWrite: false }),
+    );
+    this.shock.rotation.x = Math.PI / 2;
+    scene.add(this.shock);
     this.beacon = new THREE.Group();
     this.pad = new THREE.Mesh(
       new THREE.CylinderGeometry(2.4, 2.7, 0.35, 8),
@@ -97,41 +125,71 @@ export class Deliveries {
     this.ctx.hud.toast(`Deliver to: ${this.target.name} (ALT ${alt} m)`, false);
   }
 
-  onPackageLost() {
-    this.score = Math.max(0, this.score - 50);
+  onPackageLost(golden = false) {
+    this.score = Math.max(0, this.score - (golden ? 300 : 50));
     this.ctx.hud.setScore(this.score);
+    if (golden) this.ctx.hud.toast('💸 The insurance claim: -300.', true);
+    this.breakChain('package lost');
+    this.ctx.packages.rollNext(this.completed); // fresh roll — no golden reruns
   }
 
   _deliver(pkg) {
-    const { hud, sfx, particles, packages } = this.ctx;
+    const { hud, sfx, particles, packages, player } = this.ctx;
     pkg.delivered = true;
     const conditionPct = pkg.def.fragile ? pkg.condition : 100;
     const heightBonus = Math.round(this.target.pos.y * 2);
     const elapsed = (performance.now() - this.pickupTime) / 1000;
     const par = 40 + this.target.pos.y * 1.4;
     const speedBonus = Math.max(0, Math.round((par - elapsed) * 3));
-    const gained = Math.round((100 + heightBonus) * (0.3 + 0.7 * conditionPct / 100)) + speedBonus;
+    const airmail = player.parachute || (this._t - player.lastLaunchT < 4) || pkg.thrownT > 0;
+    const goldMult = pkg.def.golden ? 3 : 1;
+
+    // Chain: clean delivery extends it, a battered one breaks it.
+    if (conditionPct >= 90) this.chain++;
+    else if (conditionPct < 50) this.chain = 0;
+    const mult = this.chainMult;
+
+    const base = Math.round((100 + heightBonus) * (0.3 + 0.7 * conditionPct / 100));
+    const gained = Math.round((base + speedBonus + (airmail ? 75 : 0)) * mult * goldMult);
     this.score += gained;
     this.completed++;
 
+    // Itemized receipt, biggest dopamine first.
+    const lines = [`BASE +${base}`];
+    if (speedBonus > 0) lines.push(`⚡ SPEED +${speedBonus}`);
+    if (airmail) lines.push('🪂 AIRMAIL +75');
+    if (conditionPct < 100) lines.push(`CONDITION ${Math.round(conditionPct)}%`);
+    if (mult > 1) lines.push(`🔥 CHAIN ×${mult.toFixed(1)}`);
+    if (goldMult > 1) lines.push('✨ GOLDEN ×3');
+    lines.push(`= +${gained}`);
+    hud.scorePop(lines);
+
+    // Ceremony: shockwave + double confetti + flash + tiny hitstop.
     this._tmp.copy(this.beacon.position).add(new THREE.Vector3(0, 1.5, 0));
     particles.confetti(this._tmp);
+    particles.pops(this._tmp, 0xffd166);
+    this.shock.position.copy(this.beacon.position).y += 0.4;
+    this._shockT = 0.6;
+    this.ctx.hitstop?.(0.09);
+    this.ctx.shake?.(0.22);
     sfx.jingle();
     this.ctx.music?.fanfare();
     hud.setScore(this.score);
     hud.setDeliveries(this.completed);
+    hud.setChain(this.chain);
     hud.toast(`✅ DELIVERED! +${gained}`, false);
     if (conditionPct < 50) hud.toast(`…in ${Math.round(conditionPct)}% condition. They noticed.`, true);
-    else if (speedBonus > 60) hud.toast(`⚡ Speed bonus +${speedBonus}!`, true);
     hud.hideSlip();
 
     packages.remove(pkg);
+    packages.rollNext(this.completed);
     this._chooseTarget();
     hud.toast(`Next pickup at the depot. It gets worse.`, true);
     this.ctx.director.onDelivery(this.completed);
   }
 
   fixedUpdate(dt, t) {
+    this._t = t;
     // Beacon follows moving targets (summit island) and pulses.
     if (this.target.moving) {
       this.beacon.position.copy(this.target.moving.group.position).y += 1.0;
@@ -139,8 +197,19 @@ export class Deliveries {
     this.column.material.opacity = 0.3 + Math.sin(t * 2.5) * 0.08;
     this.pad.rotation.y += dt * 0.6;
 
+    // Shockwave ring expand + fade.
+    if (this._shockT > 0) {
+      this._shockT -= dt;
+      const k = 1 - this._shockT / 0.6;
+      this.shock.scale.setScalar(1 + k * 8);
+      this.shock.material.opacity = 0.8 * (1 - k);
+    } else {
+      this.shock.material.opacity = 0;
+    }
+
     const pkg = this.ctx.packages.current;
-    if (!pkg || pkg.delivered || !pkg.carried) return;
+    // Carried — or freshly thrown: yeet-to-deliver is a valid postal method.
+    if (!pkg || pkg.delivered || (!pkg.carried && pkg.thrownT <= 0)) return;
     const p = pkg.body.translation();
     const b = this.beacon.position;
     const dxz = Math.hypot(p.x - b.x, p.z - b.z);

@@ -239,7 +239,7 @@ export class Character {
   update(dt, t) {
     if (!this.loaded) return;
     const { player, camera } = this.ctx;
-    const p = player.body.translation();
+    const p = player.renderPos();
     const v = player.body.linvel();
     const hSpeed = Math.hypot(v.x, v.z);
 
@@ -271,7 +271,42 @@ export class Character {
       this.chute.visible = false;
       return;
     }
-    this._spin = 0;
+    if (this._spin > 0) {
+      // Recovering from a tumble: snap the accumulated spin to its nearest
+      // full turn so the un-lerp doesn't unwind a multi-turn backflip.
+      this._spin = 0;
+      let r = this.rig.rotation.x % (Math.PI * 2);
+      if (r > Math.PI) r -= Math.PI * 2;
+      if (r < -Math.PI) r += Math.PI * 2;
+      this.rig.rotation.x = r;
+    }
+    if (player.rollTimer > 0) {
+      // Recovery roll: one clean forward somersault over 0.45 s.
+      const k = 1 - player.rollTimer / 0.45;
+      this.rig.rotation.x = k * Math.PI * 2;
+      this.rig.position.y = 0.3 * Math.sin(k * Math.PI);
+      this.legL.rotation.x = -1.4;
+      this.legR.rotation.x = -1.2;
+      this.armL.rotation.x = -1.8;
+      this.armR.rotation.x = -1.8;
+      this.chute.visible = false;
+      return;
+    }
+    if (player.slide && player.grounded) {
+      // Belly toboggan: superman pose, arms back, legs trailing.
+      lerp(this.rig.rotation, 'x', -1.35, 12);
+      lerp(this.rig.position, 'y', 0.55, 12);
+      lerp(this.legL.rotation, 'x', 0.35 + Math.sin(t * 7) * 0.08, 10);
+      lerp(this.legR.rotation, 'x', 0.3 + Math.cos(t * 6.4) * 0.08, 10);
+      if (!carrying) {
+        lerp(this.armL.rotation, 'x', 0.7, 10);
+        lerp(this.armR.rotation, 'x', 0.7, 10);
+        lerp(this.armL.rotation, 'z', 0.5, 10);
+        lerp(this.armR.rotation, 'z', -0.5, 10);
+      }
+      this.chute.visible = false;
+      return;
+    }
     lerp(this.rig.rotation, 'x', 0, 8);
     lerp(this.rig.position, 'y', 0, 8);
 
@@ -344,8 +379,15 @@ export class Character {
       lerp(this.headG.rotation, 'y', Math.sin(t * 0.43) > 0.92 ? 0.5 : 0, 4);
     }
 
-    // Carry pose: both arms forward, hands cradling the package.
-    if (carrying) {
+    // Throw fling: arms whip forward for a beat.
+    if (player.throwAnimT > 0) {
+      lerp(this.armL.rotation, 'x', -2.1, 24);
+      lerp(this.armR.rotation, 'x', -2.1, 24);
+      lerp(this.torsoG.rotation, 'x', 0.3, 18);
+    } else if (carrying && !player.parachute) {
+      // Carry pose: both arms forward, hands cradling the package.
+      // (While parachuting the arms grip the strings instead — the package
+      // just dangles on its spring.)
       const armPitch = -1.35 + heavy * 0.5; // heavier = arms sag lower
       lerp(this.armL.rotation, 'x', armPitch, 12);
       lerp(this.armR.rotation, 'x', armPitch, 12);

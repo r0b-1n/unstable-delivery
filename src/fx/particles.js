@@ -99,12 +99,15 @@ export class Particles {
     this.scene = scene;
     this.normal = new Pool(scene, 1500, { size: 0.55 });
     this.glow = new Pool(scene, 800, { blending: THREE.AdditiveBlending, size: 0.7 });
-    this.snow = new Pool(scene, 900, { size: 0.8 });
+    // Sized for worst case: ~230 flakes/s at the summit × ~6.5 s max life —
+    // a smaller ring buffer overwrites live flakes mid-fall.
+    this.snow = new Pool(scene, 1600, { size: 0.8 });
     this._snowTimer = 0;
+    this._streakTimer = 0;
     this._v = new THREE.Vector3();
   }
 
-  update(dt, camera, altitude01, windVec) {
+  update(dt, camera, altitude01, windVec, gust = 0) {
     this.normal.update(dt, -9.8);
     this.glow.update(dt, -2);
     this.snow.update(dt, -0.9);
@@ -122,7 +125,25 @@ export class Particles {
         camera.position.z + Math.sin(a) * r + windVec.z * 2,
       );
       this.snow.spawn(this._v, { x: windVec.x * 0.6 + (Math.random() - 0.5), y: -2 - Math.random() * 2, z: windVec.z * 0.6 + (Math.random() - 0.5) }, {
-        life: 6 + Math.random() * 4, color: 0xf4faff, size: 0.7 + Math.random() * 0.8, grav: 1, drag: 0.1,
+        life: 4 + Math.random() * 2.5, color: 0xf4faff, size: 0.7 + Math.random() * 0.8, grav: 1, drag: 0.1,
+      });
+    }
+
+    // Wind streaks: make gusts visible as fast white wisps flying downwind.
+    const windLen = Math.hypot(windVec.x, windVec.z);
+    const streakRate = gust > 0.35 ? (gust * 24) * Math.min(windLen / 12, 1.5) : 0;
+    this._streakTimer += dt * streakRate;
+    while (this._streakTimer > 1) {
+      this._streakTimer -= 1;
+      const a = Math.random() * Math.PI * 2;
+      const r = 5 + Math.random() * 16;
+      this._v.set(
+        camera.position.x + Math.cos(a) * r - windVec.x * 1.2,
+        camera.position.y - 2 + Math.random() * 7,
+        camera.position.z + Math.sin(a) * r - windVec.z * 1.2,
+      );
+      this.snow.spawn(this._v, { x: windVec.x * 2.2, y: (Math.random() - 0.3) * 1.5, z: windVec.z * 2.2 }, {
+        life: 0.45 + Math.random() * 0.3, color: 0xffffff, size: 0.5 + Math.random() * 0.5, grav: 0, drag: 0,
       });
     }
   }
@@ -155,6 +176,10 @@ export class Particles {
 
   dust(pos, intensity = 1) {
     this.burst(pos, { count: Math.floor(8 * intensity), speed: 2.4 * intensity, up: 0.5, life: 0.7, size: 1.6, color: 0xcfd8e6, grav: 0.15, drag: 2 });
+  }
+
+  smoke(pos) {
+    this.burst(pos, { count: 2, speed: 0.8, up: 1.6, life: 1.4, size: 1.8, color: 0x777d88, grav: -0.25, drag: 1.4 });
   }
 
   steam(pos, strength = 1) {
