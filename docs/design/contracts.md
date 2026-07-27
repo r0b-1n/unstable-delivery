@@ -211,3 +211,88 @@ the *bottom* and `!current` no longer means "that parcel is gone" — the potion
 check reported a survival that had actually detonated, because a crate below it
 was still held. Checks that care about a specific parcel now test
 `packages.active.includes(pkg)`.
+
+---
+
+## 5. v5 — the map
+
+The v4 design overhaul gave the game a voice, an interface, shifts and a look.
+It did not touch the thing the whole look is applied to. This section records
+what the rebuild changed and, more usefully, what measuring it turned up.
+
+### What the terrain is now
+
+One 801×801 height grid at 2.0 m, built once in ~0.9 s, read three ways: a
+Rapier **heightfield** collider, 256 visual chunks at three LODs, and the
+scatter's placement queries. Nothing else evaluates noise.
+
+| | v4 | v5 |
+|---|---|---|
+| Extent | 480 m × 170 m | **1600 m × 500 m** |
+| Grid | 150 segments, 3.2 m | 800 segments, 2.0 m |
+| Collider | trimesh, 45 k tris + BVH | **one heightfield** (grid lookup, no BVH) |
+| Visual | one mesh | 256 chunks, LOD 2/4/10 m, skirted |
+| Shading | flat | smooth, with facets restored by `aRock` |
+| Scatter | 496 objects, uniform | ~13 000, clustered on a shared density field |
+| Route | 2.2 km | 3.8 km |
+| Cable car | 8.6 m/s, 6 cabins | 24 m/s, 20 cabins, second depot |
+| Draw calls | ~105–131 | ~140 |
+
+### Six things that only measuring found
+
+- **The mountain was a cone on a dinner plate.** `(1 − r/620)^1.65` puts
+  nearly all the height inside a third of the radius; everything outside is a
+  skirt under 7 % grade. A 1600 m mountain read as a 500 m one, which defeats
+  the entire rebuild. The exponent is now **1.15** with `SUMMIT_R` out at 700.
+  This was invisible from every ground-level screenshot and obvious from the
+  first one taken from a kilometre out.
+- **The cable ran over the summit.** Stations a quarter of the manifest apart
+  sit most of a spiral turn from each other, so the straight chord between them
+  crosses the peak — and the clearance rule dutifully lifted the cable above
+  it. Cabins left the valley station on a **60 % gradient**. The span points
+  are now sampled along the route, giving the cable the trail's own 13 %.
+- **The gondola never had a speed problem.** It had a carry problem: the rider
+  chased the floor's velocity through an impulse controller with a tenth of a
+  second of lag, and drifted outward on every curve. With a rigid transform
+  carry the cabin does 24 m/s and the rider stays put. Measured: local position
+  inside the cabin held at ±0.15 m over 145 frames, against +1.5 m of drift
+  before.
+- **Friction re-injects platform velocity.** The carry alone was not enough —
+  the contact solver kept feeding world velocity back in through a floor doing
+  24 m/s, the carry added to it, and the courier slid out the front at
+  1.6 m/s. The ground gain goes to 40 on moving ground to drain it faster than
+  friction fills it.
+- **Terracing on a fixed step is a lathe.** At 15 m and half strength the
+  quantisation is a perfect contour line; crossed with the radial gullies the
+  upper mountain was a waffle. Strength 0.2 and a noise-shifted step size.
+- **A tinted vertex is four square metres.** Under smooth shading the flower
+  speckle that worked on a flat-shaded 3.2 m grid became metre-wide pink smears.
+  The vertex tint is now barely there and the flowers are instanced geometry.
+
+### Two traps that fail silently
+
+- **Rapier heightfields are column-major**; the generator builds row-major.
+  Transposed, the collider is the terrain mirrored about its diagonal — no
+  crash, no warning, no console error, just a world where the ground is not
+  where it is drawn. `verify.mjs` raycasts four asymmetric points against
+  `heightAt` and demands 5 cm.
+- **Rapier rebuilds its query pipeline inside `world.step()`.** A raycast fired
+  at the title screen, before anything has stepped, hits nothing at all — which
+  looks exactly like a missing collider. The probe runs after `start()`.
+
+### Deviations from the plan
+
+| Planned | Shipped | Why |
+|---|---|---|
+| `CELL` 1.5 m | **2.0 m** | Measured: the height pass is 369 ms of noise at 2.0 m and the whole grid 0.9 s. At 1.5 m it is 1.14 M points for a difference invisible against 500 m of relief — and "finer and softer" is delivered by the normal blend, not the cell size. `CELL` is one constant if the trade ever looks different. |
+| Switchbacks in `pathPoint` | Radius wobble only | Hairpins need `angle(t)` to reverse, and the analytic spiral inverse in `_nearestPath` — which is what makes a 641 k-point grid buildable at all — requires it monotonic. The wobble grows on the steep flank instead. |
+| Erosion | Not attempted | Closed-form ridged noise plus gullies gets the read at this facet size; a droplet pass costs seconds of boot for detail below 2 m. |
+| Web Worker for the grid | Not needed | 0.9 s, gated in the suite at 3 s. |
+
+### Still unjudged
+
+`QUOTA_SLACK` was measured for shift 1 at the old scale and shift 1 now reads
+1188 against 511. The quota derives from `spot.pos.y` so it is self-consistent
+and scores scale with it, but the curve across shifts 2–8 is computed, not
+played. Round-trip times with the second depot are likewise reasoned, not
+timed.

@@ -2,16 +2,26 @@ import * as THREE from 'three';
 import { OBJ } from '../art/palette.js';
 import { InstancedPool } from '../art/instanced.js';
 
-const STATION_TS = [0.02, 0.28, 0.52, 0.76, 0.97];
+// Stations sit on the landmarks: depot, forest tunnel, quarry, weather
+// station, summit. A station you can describe is a station you can plan for.
+const STATION_TS = [0.02, 0.28, 0.45, 0.80, 0.97];
 const DROP = 3.55;       // cable point -> cabin centre
-const GONDOLAS = 6;
-// 9.5, not 7.5. WALK is 6.6 and SPRINT is 10.8, so at 7.5 the gondola was
-// SLOWER than running once you add the wait — while the anvil's own label
-// says "HEAVY. TAKE THE CABLE CAR." The label was a lie for three commits.
-// 8.6, not 9.5: at 9.5 the cabin throws its passenger out on the curves, which
-// makes the gondola useless in a different way. 8.6 still clears WALK (6.6)
-// comfortably, and the station-crawl floor below does the rest of the work.
-const BASE_SPEED = 8.6;  // m/s along the cable
+// Twenty, not six. The loop is now roughly 8 km of cable; at six cabins the
+// headway would be a minute and the fastest route up the mountain would be
+// spent standing at a pad.
+const GONDOLAS = 20;
+// 24 m/s. The cap used to be 8.6 for one reason: above about 9 the cabin threw
+// its passenger out on the curves. That was never a speed problem, it was a
+// carry problem — the rider was chasing the floor's velocity with a tenth of a
+// second of lag and drifting outward on every turn. PlayerController now takes
+// the platform's transform outright (_carryPlatform), so the cabin can move as
+// fast as the route needs.
+//
+// And the route needs this: the trail is ~3.8 km end to end. On foot that is
+// six minutes uphill under load. The cable car is not a novelty any more, it is
+// how a parcel service moves parcels up a mountain, which is what it always
+// said on the anvil.
+const BASE_SPEED = 24;  // m/s along the cable
 
 // A closed-loop cable up the mountain: the "up" line passes low over five
 // station pads on the path; the return line runs higher and offset. Gondolas
@@ -62,18 +72,30 @@ export class CableCar {
     });
 
     // --- Closed cable loop: up line + elevated return line ---
+    //
+    // The span points are sampled ALONG THE ROUTE, not lerped between stations.
+    // Two stations a quarter of the manifest apart sit most of a spiral turn
+    // from each other, so the straight chord between them runs clean over the
+    // summit — and the old clearance rule, which lifted a midpoint to
+    // `ground + 14`, then dutifully raised the cable above the peak. The cable
+    // left the valley station on a 60 % gradient, and a cabin floor climbing at
+    // 12 m/s does not carry a passenger, it launches one.
+    //
+    // Following the spiral instead gives the cable the trail's own gradient,
+    // which is 13 %.
     const pts = [];
-    const clearance = (a, b, k, lift) => {
-      const mid = a.clone().lerp(b, k);
-      const ground = terrain.heightAt(mid.x, mid.z);
-      mid.y = Math.max(mid.y, ground + 14 + lift);
-      return mid;
+    const spanPoint = (tt, lift) => {
+      const pp = terrain.pathPoint(tt);
+      const len = Math.hypot(pp.x, pp.z) || 1;
+      const x = pp.x + (pp.x / len) * (pp.width + 3);
+      const z = pp.z + (pp.z / len) * (pp.width + 3);
+      return new THREE.Vector3(x, Math.max(terrain.heightAt(x, z), pp.h) + 16 + lift, z);
     };
     for (let i = 0; i < upPoints.length; i++) {
       pts.push(upPoints[i]);
       if (i < upPoints.length - 1) {
-        pts.push(clearance(upPoints[i], upPoints[i + 1], 0.33, 0));
-        pts.push(clearance(upPoints[i], upPoints[i + 1], 0.66, 0));
+        const t0 = STATION_TS[i], t1 = STATION_TS[i + 1];
+        for (const k of [0.2, 0.4, 0.6, 0.8]) pts.push(spanPoint(t0 + (t1 - t0) * k, 0));
       }
     }
     // Return line: reversed, pushed outward and raised.
@@ -85,11 +107,12 @@ export class CableCar {
       q.y += 9;
       return q;
     });
+    const retTs = [...STATION_TS].reverse();
     for (let i = 0; i < ret.length; i++) {
       pts.push(ret[i]);
       if (i < ret.length - 1) {
-        pts.push(clearance(ret[i], ret[i + 1], 0.33, 9));
-        pts.push(clearance(ret[i], ret[i + 1], 0.66, 9));
+        const t0 = retTs[i], t1 = retTs[i + 1];
+        for (const k of [0.2, 0.4, 0.6, 0.8]) pts.push(spanPoint(t0 + (t1 - t0) * k, 9));
       }
     }
     this.curve = new THREE.CatmullRomCurve3(pts, true, 'catmullrom', 0.35);
@@ -102,12 +125,12 @@ export class CableCar {
 
     // --- Pylons under the up-line midpoints ---
     const pylonMat = new THREE.MeshStandardMaterial({ color: OBJ.pylon, flatShading: true });
-    const upLineCount = upPoints.length * 3 - 2; // stations at i % 3 === 0
+    const upLineCount = upPoints.length * 5 - 4; // stations at i % 5 === 0
     // Unit-height mast scaled per instance — every pylon is a different length.
     const mastPool = new InstancedPool(scene, new THREE.CylinderGeometry(0.35, 0.6, 1, 6), pylonMat, upLineCount);
     const armPool = new InstancedPool(scene, new THREE.BoxGeometry(0.35, 0.35, 3.4), pylonMat, upLineCount, { castShadow: false });
     for (let i = 1; i < upLineCount; i++) {
-      if (i % 3 === 0) continue;
+      if (i % 5 === 0) continue;
       const p = pts[i];
       // The mast stands BESIDE the cable line (radially outward) with an arm
       // reaching over — a mast on the line itself would impale every gondola.
@@ -116,6 +139,12 @@ export class CableCar {
       const mz = p.z + (p.z / len) * 3.0;
       const ground = terrain.heightAt(mx, mz);
       const h = p.y + 0.6 - ground;
+      // A mast stands from the ground up to the cable. Where the span crosses a
+      // gully the point three meters to the outside can be higher than the
+      // cable itself, and a cylinder collider with a negative half-height is not
+      // an error Rapier reports — it is a wasm `unreachable` trap that takes the
+      // whole boot with it. No mast is the right answer there anyway.
+      if (h < 2) continue;
       const pylon = mastPool.obtain();
       pylon.position.set(mx, ground + h / 2, mz);
       pylon.scale.y = h;
@@ -198,7 +227,10 @@ export class CableCar {
     // humane, but dawdling through a station no longer eats the speed gain.
     const pass = this.ctx.meta?.eff('cableSpeed') ?? 1;
     const crawl = this.ctx.meta?.eff('cableCrawl') ?? 0.3;
-    return BASE_SPEED * pass * (crawl + (1 - crawl) * Math.min(d / 18, 1));
+    // 45 m, not 18: the approach ramp is a DISTANCE, and at 24 m/s an 18 m
+    // ramp is three quarters of a second — the cabin would arrive at line
+    // speed and leave at line speed with a token dip in between.
+    return BASE_SPEED * pass * (crawl + (1 - crawl) * Math.min(d / 45, 1));
   }
 
   fixedUpdate(dt, t) {

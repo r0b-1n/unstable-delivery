@@ -103,13 +103,28 @@ sample count all move together.
 
 ## The mountain
 
+**1600 m across and 500 m tall**, and a single hand-built massif rather than a
+fresh roll each shift — the point is that a route can be learned. The shape is
+a ridged multifractal over a domain-warped, compass-asymmetric profile, with
+bedding terraces through the middle, a glacier cirque bitten out of one flank
+and drainage gullies running the fall line. It looks different from every side,
+which the old radially symmetric cone did not.
+
 Five vertical bands, each meaner than the last: **Sunny Meadows** →
 **Pinewood Ledges** (bounce mushrooms, seesaws) → **Windy Cliffs** (geysers,
 elevator platforms, gusts) → **The Frozen Face** (ice, icicles, boulders) →
-**Storm Summit** (floating islands, lightning). A cable car with five
-stations loops from base camp to the summit — hop into a passing gondola,
-stations double as respawn checkpoints. The more you deliver, the more the
-chaos director turns everything up.
+**Storm Summit** (floating islands, lightning).
+
+Ten fixed set pieces mark the 3.8 km route: the valley depot, a tarn with a
+waterfall and a log bridge, a pinewood tunnel, a rock arch the trail runs
+under, the mid-station quarry, the ridge, the glacier's serac field, the storm
+weather station, and the summit shrine.
+
+The cable car is transport now, not scenery: five stations, twenty cabins,
+24 m/s, and consignments for the upper half of the manifest are dispatched
+from the mid-station counter instead of the valley. Stations double as respawn
+checkpoints. The more you deliver, the more the chaos director turns
+everything up.
 
 ## Tech
 
@@ -121,8 +136,17 @@ chaos director turns everything up.
   does ACES, split-tone, vignette, damage pulse and grain in one shader and
   encodes sRGB itself. Multisampled target instead of FXAA — FXAA smears the
   low-poly silhouettes the whole look is built from
-- [Rapier](https://rapier.rs/) physics — terrain trimesh, kinematic gondolas
-  and platforms, spring-carried cargo, contact-force damage
+- Terrain is one 801x801 height grid built once (~0.9 s), then read three ways:
+  a Rapier **heightfield** collider, 256 visual chunks at three LODs swapped
+  against camera distance, and the scatter's placement queries. Chunk edges
+  carry skirts; normals come from the full-resolution grid at every LOD, so a
+  detail swap moves a silhouette without moving the lighting
+- Terrain shading is smooth-shaded with the facets given back selectively: a
+  per-vertex `aRock` blends the interpolated normal toward the screen-space
+  face normal, so meadows and snowfields flow while cliffs and ridgelines stay
+  hard. Snow only sticks where the ground is flat
+- [Rapier](https://rapier.rs/) physics — terrain heightfield, kinematic
+  gondolas and platforms, spring-carried cargo, contact-force damage
 - Fully procedural WebAudio SFX (wind, thuds, boings, jingles, one synthesized sheep)
 - Vite, plain ES modules, no framework
 
@@ -138,6 +162,21 @@ ride, mushroom launch, parachute, potion detonation, the three-high stack, a
 language switch mid-game, twenty pause/resume cycles, a full shift from
 briefing to results, a localStorage round-trip and a chaos soak — and fails on
 any console error, failed request or HTTP >= 400.
+
+Three of its checks exist purely to keep the map honest: a **collider probe**
+raycasts four asymmetric points and demands the physics ground sit within 5 cm
+of the drawn ground (Rapier wants its height matrix column-major and the
+generator builds it row-major — get that wrong and nothing errors, the world is
+just mirrored about its diagonal); a **route probe** walks 400 points of trail
+and fails if any of it leaves the ground; and a build-time gate fails if the
+height grid ever takes longer than 3 s.
+
+```bash
+node scripts/shots.mjs         # look-dev: four compass views + seven route stops
+```
+
+Writes to `verify-out/look/`. Art direction is the one thing the suite cannot
+judge, so this exists to put the frames in front of someone who can.
 
 Timing-sensitive checks are driven by `__game.runFrames(n)`, which advances the
 simulation by exact fixed steps without rendering. Headless runs on SwiftShader

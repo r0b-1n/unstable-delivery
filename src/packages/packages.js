@@ -35,7 +35,7 @@ export class Packages {
     this.slipCount = 0;
     this._tmpV = new THREE.Vector3();
     this._anchor = new THREE.Vector3();
-    this._buildChute();
+    this._buildDepots();
     this.rollNext(0);
   }
 
@@ -52,6 +52,7 @@ export class Packages {
   // Decide the NEXT package ahead of time so the depot preview can show it
   // (and glow gold for insured cargo).
   rollNext(n) {
+    this._pickDepot();
     // Inside a shift the manifest decides; outside one (endless test mode) the
     // original escalation ladder still runs.
     const line = this.ctx.shift?.currentLine();
@@ -66,11 +67,49 @@ export class Packages {
     else { m.color.set(OBJ.crateWood); m.emissive.set(OBJ.emCrate); m.emissiveIntensity = 0.4; }
   }
 
-  _buildChute() {
+  // Two counters, not one.
+  //
+  // The mountain is 3.8 km of trail long. A consignment for the weather station
+  // dispatched from the valley is a seven-minute round trip in which nothing
+  // happens for five of them, and no amount of cable car speed fixes that,
+  // because the distance is the problem. So the upper half of the manifest is
+  // dispatched from the mid-station counter instead. A freight company with a
+  // transhipment point is not a concession, it is what a freight company is.
+  _buildDepots() {
+    this.depots = [this._buildDepot(0.012), this._buildDepot(0.455)];
+    this._depot = 0;
+    // Altitude above which a consignment is handed over up the hill. The mid
+    // station is at t = 0.45; anything the manifest sends above it starts there.
+    this.midAlt = this.ctx.terrain.pathPoint(0.45).h;
+    this._showDepot();
+  }
+
+  get chutePos() { return this.depots[this._depot].pos; }
+  get ring() { return this.depots[this._depot].ring; }
+  get preview() { return this.depots[this._depot].preview; }
+
+  _showDepot() {
+    this.depots.forEach((d, i) => {
+      d.ring.visible = d.preview.visible = i === this._depot;
+    });
+  }
+
+  // Called on every roll: the counter follows the manifest, not the courier.
+  _pickDepot() {
+    if (!this.depots) return;
+    const alt = this.ctx.deliveries?.target?.pos.y ?? 0;
+    const want = alt > this.midAlt ? 1 : 0;
+    if (want === this._depot) return;
+    this._depot = want;
+    this._showDepot();
+    this.ctx.hud?.toast(want ? 'toast.depotmid' : 'toast.depotvalley', null, { small: true });
+  }
+
+  _buildDepot(t) {
     const { terrain, scene } = this.ctx;
-    const p = terrain.pathPoint(0.012);
+    const p = terrain.pathPoint(t);
     const y = terrain.heightAt(p.x, p.z);
-    this.chutePos = new THREE.Vector3(p.x, y, p.z);
+    const pos = new THREE.Vector3(p.x, y, p.z);
 
     // Depot: a small parcel kiosk + glowing pickup ring.
     // Strong emissive so undersides don't read as black blobs.
@@ -96,21 +135,22 @@ export class Packages {
     kiosk.traverse((o) => { o.castShadow = true; });
     scene.add(kiosk);
 
-    this.ring = new THREE.Mesh(
+    const ring = new THREE.Mesh(
       new THREE.TorusGeometry(1.7, 0.14, 6, 24),
       new THREE.MeshBasicMaterial({ color: OBJ.liveryGold, transparent: true, opacity: 0.85 }),
     );
-    this.ring.rotation.x = Math.PI / 2;
-    this.ring.position.set(p.x, y + 0.25, p.z);
-    scene.add(this.ring);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.set(p.x, y + 0.25, p.z);
+    scene.add(ring);
 
     // Spinning preview of the next box above the chute.
-    this.preview = new THREE.Mesh(
+    const preview = new THREE.Mesh(
       new THREE.BoxGeometry(0.8, 0.8, 0.8),
       new THREE.MeshStandardMaterial({ color: OBJ.crateWood, flatShading: true, emissive: OBJ.emCrate, emissiveIntensity: 0.4 }),
     );
-    this.preview.position.set(p.x, y + 1.6, p.z);
-    scene.add(this.preview);
+    preview.position.set(p.x, y + 1.6, p.z);
+    scene.add(preview);
+    return { pos, ring, preview };
   }
 
   typeForDelivery(n) {

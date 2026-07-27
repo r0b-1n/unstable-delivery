@@ -26,12 +26,85 @@ await page.waitForFunction(() => window.__game && window.__game.state === 'title
 await page.screenshot({ path: `${OUT}/shot-title.png` });
 console.log('TITLE OK');
 
+
 // Start the game programmatically (pointer lock will fail silently headless, fine)
 await page.evaluate(() => window.__game.start());
 await page.waitForTimeout(1500);
 const pos0 = await page.evaluate(() => window.__game.playerPos);
 console.log('spawn pos', pos0.map((n) => n.toFixed(1)).join(', '));
 await page.screenshot({ path: `${OUT}/shot-spawn.png` });
+
+// --- Collider probe: the ground must be where it is drawn ---
+// The terrain collider is a Rapier heightfield, and Rapier wants its height
+// matrix column-major while the generator builds it row-major. Get that
+// backwards and the collider is the terrain mirrored about its diagonal: no
+// crash, no warning, no console error, just a world where you fall through
+// some hills and stand on thin air over others. Four asymmetric points, each
+// checked against a raycast, catch it before anything else has a chance to.
+//
+// It runs after start(), not at the title screen: Rapier rebuilds its query
+// pipeline inside world.step(), so a raycast fired before the first step hits
+// nothing at all and says nothing about whether the collider is right.
+const collide = await page.evaluate(() => {
+  const ctx = window.__game.ctx;
+  const R = ctx.physics.RAPIER;
+  const probes = [[120, -340], [-410, 95], [55, 480], [-260, -180]].map(([x, z]) => {
+    const hit = ctx.physics.world.castRay(
+      new R.Ray({ x, y: 900, z }, { x: 0, y: -1, z: 0 }), 2000, true);
+    const toi = hit ? (hit.timeOfImpact ?? hit.toi) : null;
+    return { x, z, expect: ctx.terrain.heightAt(x, z), got: toi === null ? null : 900 - toi };
+  });
+  return { probes, buildMs: ctx.terrain.buildMs, chunks: ctx.terrain.chunks.length };
+});
+console.log(`terrain: ${collide.chunks} chunks, grid built in ${collide.buildMs.toFixed(0)} ms`);
+for (const p of collide.probes) {
+  if (p.got === null || !Number.isFinite(p.got)) {
+    throw new Error(`Collider probe at ${p.x},${p.z} hit nothing — heightfield missing or mis-sized`);
+  }
+  const err = Math.abs(p.got - p.expect);
+  console.log(`  probe ${p.x},${p.z}: drawn ${p.expect.toFixed(2)} collider ${p.got.toFixed(2)} (${err.toFixed(3)})`);
+  if (err > 0.05) throw new Error(`Collider and mesh disagree by ${err.toFixed(2)} m — check the column-major transpose`);
+}
+if (collide.buildMs > 3000) throw new Error(`Terrain grid took ${collide.buildMs.toFixed(0)} ms — move it to a worker`);
+
+// --- Route probe: the trail must lie on the ground the whole way up ---
+// The height field carves the route into the flank; if the noise amplitude
+// ever outruns the carve, the trail ends in a wall or hangs over a drop and
+// the only symptom is a player who cannot get to shift six.
+const route = await page.evaluate(() => {
+  const t = window.__game.ctx.terrain;
+  const gaps = t.constructor.GAPS;
+  let worst = 0, worstT = 0, n = 0;
+  for (let i = 0; i <= 400; i++) {
+    const tt = i / 400;
+    // Three gap half-widths of clearance, not one. A chasm's walls are blended
+    // over a further `blend` meters of ground either side, so the trail is
+    // legitimately 13 m below its nominal height right at a lip — which is the
+    // whole point of a chasm and not a defect in the carve.
+    if (gaps.some((g) => Math.abs(tt - g.t) < g.w * 3)) continue;
+    const p = t.pathPoint(tt);
+    const d = Math.abs(t.heightAt(p.x, p.z) - p.h);
+    n++;
+    if (d > worst) { worst = d; worstT = tt; }
+  }
+  return { worst, worstT, n };
+});
+console.log(`route: worst carve error ${route.worst.toFixed(2)} m at t=${route.worstT.toFixed(3)} over ${route.n} samples`);
+if (route.worst > 1.0) throw new Error(`Trail leaves the ground by ${route.worst.toFixed(1)} m at t=${route.worstT}`);
+
+// --- LOD probe: every chunk resolved, no neighbour more than one step apart ---
+const lod = await page.evaluate(() => {
+  const t = window.__game.ctx.terrain;
+  const counts = {};
+  let unbuilt = 0;
+  for (const c of t.chunks) {
+    if (!c.mesh || c.lod < 0) unbuilt++;
+    counts[c.lod] = (counts[c.lod] ?? 0) + 1;
+  }
+  return { unbuilt, counts };
+});
+console.log('lod:', JSON.stringify(lod));
+if (lod.unbuilt) throw new Error(`${lod.unbuilt} terrain chunks have no geometry`);
 
 // Walk forward for 2 s of SIMULATION, not 2 s of wall clock. Headless renders
 // at ~12 fps and the post-processing chain makes that slower still, so a sleep
@@ -111,7 +184,10 @@ const ride = await page.evaluate(() => {
   return { moved: Math.hypot(after[0] - before[0], after[2] - before[2]), stayedOn };
 });
 console.log('gondola ride:', JSON.stringify(ride));
-if (!ride.stayedOn || ride.moved < 3) throw new Error('Gondola did not carry the player');
+// 10 m, not 3. Line speed is 24 m/s and the station crawl floor is 0.3 of it,
+// so even a cabin that spends the whole 2.5 s creeping through a pad covers
+// 18 m. Anything under 10 means it is not moving under its own power.
+if (!ride.stayedOn || ride.moved < 10) throw new Error('Gondola did not carry the player');
 await page.screenshot({ path: `${OUT}/shot-gondola.png` });
 
 // --- Mushroom bounce ---

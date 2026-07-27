@@ -8,7 +8,7 @@ import * as THREE from 'three';
 // and the loss is silent (no error, the effect just never appears). Everything
 // that needs injecting goes through this call.
 
-export function patchMaterial(material, { rim = null, emissiveFloor = 0 } = {}) {
+export function patchMaterial(material, { rim = null, emissiveFloor = 0, faceBlend = false } = {}) {
   const uniforms = {};
   if (rim) {
     uniforms.uRimColor = { value: new THREE.Color(rim.color ?? 0xffe9c9) };
@@ -41,6 +41,31 @@ export function patchMaterial(material, { rim = null, emissiveFloor = 0 } = {}) 
       // A hazard silhouetted against bright snow must never read as a hole in
       // the world — the player has to see it is a rock, at speed, from behind.
       body += '\n        gl_FragColor.rgb = max(gl_FragColor.rgb, diffuseColor.rgb * uEmFloor);';
+    }
+    if (faceBlend) {
+      // The terrain is built smooth and indexed, then given its facets back
+      // selectively: `aRock` says how much of this vertex is exposed rock, and
+      // rock gets the flat-shaded face normal while grass and snow keep the
+      // interpolated one. Meadows and snowfields flow, cliffs and ridgelines
+      // stay hard — which is the whole of "finer and softer" without giving up
+      // the low-poly read where it carries the silhouette.
+      //
+      // The face normal is reconstructed from screen-space derivatives of the
+      // view position, and then flipped to agree with the smooth normal: which
+      // way the cross product points depends on the platform's screen-space
+      // Y direction, and guessing wrong lights every cliff from inside.
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aRock;\nvarying float vRock;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vRock = aRock;');
+      head += '\nvarying float vRock;';
+      sh.fragmentShader = sh.fragmentShader.replace('#include <normal_fragment_begin>',
+        `#include <normal_fragment_begin>
+        {
+          vec3 fp = -vViewPosition;
+          vec3 faceN = normalize(cross(dFdx(fp), dFdy(fp)));
+          faceN *= sign(dot(faceN, normal));
+          normal = normalize(mix(normal, faceN, smoothstep(0.30, 0.72, vRock)));
+        }`);
     }
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', head)

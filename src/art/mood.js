@@ -13,7 +13,11 @@ import { bandFloat, bandColor, bandNum } from './palette.js';
 // (how late in the working day it is — the sun sinks and warms as the shift
 // wears on). Altitude owns hue and density; the shift owns the sun's angle.
 
-const SUN_DIST = 150;
+// The sun rig and the sky dome both follow the courier. The dome has to clear
+// the horizon range, which stands at up to 3 km out in world space while the
+// dome is centred on a player who can be 800 m off the origin.
+const SUN_DIST = 220;
+const SKY_R = 4600;
 
 export class Mood {
   constructor(ctx) {
@@ -33,7 +37,7 @@ export class Mood {
     };
 
     this.sky = new THREE.Mesh(
-      new THREE.SphereGeometry(900, 32, 16),
+      new THREE.SphereGeometry(SKY_R, 32, 16),
       new THREE.ShaderMaterial({
         side: THREE.BackSide,
         depthWrite: false,
@@ -101,8 +105,8 @@ export class Mood {
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(2048, 2048);
     this.sun.shadow.camera.near = 10;
-    this.sun.shadow.camera.far = 340;
-    const S = 55;
+    this.sun.shadow.camera.far = 520;
+    const S = 75;
     this.sun.shadow.camera.left = -S; this.sun.shadow.camera.right = S;
     this.sun.shadow.camera.top = S; this.sun.shadow.camera.bottom = -S;
     // Paired fix. bias alone at -0.0004 pushed shadows off their casters
@@ -134,8 +138,8 @@ export class Mood {
     this.sunDir.set(Math.cos(azim) * Math.cos(elev), Math.sin(elev), Math.sin(azim) * Math.cos(elev));
     u.sunDir.value.copy(this.sunDir);
 
-    // Sun rig follows the courier so the 110 m shadow box stays useful
-    // everywhere on a 480 m mountain.
+    // Sun rig follows the courier so the 150 m shadow box stays useful
+    // everywhere on a 1600 m mountain.
     this.sun.position.set(
       playerPos.x + this.sunDir.x * SUN_DIST,
       playerPos.y + this.sunDir.y * SUN_DIST,

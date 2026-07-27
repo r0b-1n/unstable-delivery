@@ -9,6 +9,12 @@ const WALK = 6.6;
 const SPRINT = 10.8;
 const JUMP = 11.2;
 
+// Scratch for the moving-platform carry, which runs 60 times a second.
+const _carryV = new THREE.Vector3();
+const _carryT = new THREE.Vector3();
+const _carryQa = new THREE.Quaternion();
+const _carryQb = new THREE.Quaternion();
+
 // Dynamic capsule with force-based movement so the world can still shove,
 // launch and bully the courier. Also owns the third-person camera.
 export class PlayerController {
@@ -18,6 +24,8 @@ export class PlayerController {
     this.keys = new Set();
     this.grounded = false;
     this.groundIsTerrain = false;
+    this.groundBody = null;
+    this._carrier = null;      // handle of the platform currently carrying us
     this.coyote = 0;
     this.jumpBuffer = 0;
     this.knockTimer = 0;
@@ -188,12 +196,68 @@ export class PlayerController {
     this.grounded = !!hit;
     this.groundIsTerrain = !!hit && hit.collider.handle === this.ctx.terrain.collider.handle;
     this.groundVel = { x: 0, y: 0, z: 0 };
+    this.groundBody = null;
     if (this.grounded) {
       this.coyote = 0.13;
-      // Moving ground (gondolas, elevators, islands): ride along with it.
+      // Moving ground (gondolas, elevators, islands).
       const gb = hit.collider.parent();
-      if (gb && !gb.isFixed()) this.groundVel = gb.linvel();
+      if (gb && !gb.isFixed()) { this.groundBody = gb; this.groundVel = gb.linvel(); }
     }
+  }
+
+  // Rigid carry on moving ground.
+  //
+  // This used to be done by adding the platform's velocity to the movement
+  // target and letting the impulse controller chase it. That works on a lift,
+  // which only translates. It does not work on a gondola, which YAWS: the
+  // controller approaches the new target with a time constant of a tenth of a
+  // second, and on every curve the rider slides outward by exactly that lag.
+  // At 8.6 m/s it was survivable, which is why the cable car was capped there
+  // for three commits while the anvil's own label said TAKE THE CABLE CAR. At
+  // anything faster the rider is scraped over the bordwall.
+  //
+  // So: take the platform's frame-to-frame transform and apply it to the
+  // courier outright. Position within the cabin is preserved through turns, and
+  // the movement controller below only ever has to produce motion RELATIVE to
+  // the floor — which is what a person walking about in a cable car is doing.
+  _carryPlatform() {
+    const gb = this.groundBody;
+    if (!gb) {
+      // Two frames of grace before declaring the ride over. A cabin crossing a
+      // pylon jostles its passenger enough to break contact for a single step,
+      // and handing them 24 m/s of launch momentum for that would fire them
+      // out of a gondola they never left.
+      this._carryLost = (this._carryLost ?? 0) + 1;
+      if (this._carrier !== null && this._carryLost >= 2) {
+        // Stepping off keeps the momentum. Without this the courier would leave
+        // a gondola doing 24 m/s and simply drop, which is both wrong and much
+        // less funny than the alternative.
+        if (this._carryVel) {
+          const v = this.body.linvel();
+          this.body.setLinvel({ x: v.x + this._carryVel.x, y: v.y, z: v.z + this._carryVel.z }, true);
+        }
+        this._carrier = null;
+      }
+      return;
+    }
+    this._carryLost = 0;
+    const tr = gb.translation(), rot = gb.rotation();
+    if (this._carrier === gb.handle) {
+      const p = this.body.translation();
+      // Express the courier in the platform's OLD frame, then read them back
+      // out of its new one.
+      _carryQa.set(this._prevRot.x, this._prevRot.y, this._prevRot.z, this._prevRot.w).conjugate();
+      _carryQb.set(rot.x, rot.y, rot.z, rot.w);
+      _carryV.set(p.x - this._prevPos.x, p.y - this._prevPos.y, p.z - this._prevPos.z)
+        .applyQuaternion(_carryQa)
+        .applyQuaternion(_carryQb)
+        .add(_carryT.set(tr.x, tr.y, tr.z));
+      this.body.setTranslation({ x: _carryV.x, y: _carryV.y, z: _carryV.z }, true);
+    }
+    this._carrier = gb.handle;
+    this._prevPos = { x: tr.x, y: tr.y, z: tr.z };
+    this._prevRot = { x: rot.x, y: rot.y, z: rot.z, w: rot.w };
+    this._carryVel = gb.linvel();
   }
 
   fixedUpdate(dt) {
@@ -202,6 +266,7 @@ export class PlayerController {
     const v = this.body.linvel();
 
     this._groundCheck();
+    this._carryPlatform();
     this.coyote = Math.max(0, this.coyote - dt);
     this.jumpBuffer = Math.max(0, this.jumpBuffer - dt);
     this.knockTimer = Math.max(0, this.knockTimer - dt);
@@ -252,14 +317,24 @@ export class PlayerController {
     const speed = (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? SPRINT : WALK) * massFactor;
 
     // --- Velocity approach via impulses so external forces still matter ---
-    // Desired velocity is relative to whatever we're standing on.
-    const wantX = (hasInput ? dx * speed : 0) + this.groundVel.x;
-    const wantZ = (hasInput ? dz * speed : 0) + this.groundVel.z;
+    // Desired velocity is relative to whatever we're standing on — and on
+    // moving ground that is now literally true, because _carryPlatform has
+    // already applied the floor's own motion. Adding groundVel here as well
+    // would move the courier twice per step and post them out the front of
+    // the cabin.
+    const wantX = hasInput ? dx * speed : 0;
+    const wantZ = hasInput ? dz * speed : 0;
     let gain;
     if (this.slide && !this.grounded) gain = 2.6;         // airborne: normal air control
     else if (this.slide) gain = hasInput ? 1.5 : 0.25;    // steer, don't brake
     else if (this.onIce) gain = hasInput ? 2.2 : 0.4;     // skating rink
-    else if (this.grounded) gain = hasInput ? 14 : 10;
+    // On moving ground the carry already supplies the floor's motion, so this
+    // controller only has to hold the courier still RELATIVE to it. The contact
+    // solver disagrees: friction against a floor doing 24 m/s keeps injecting
+    // world velocity, which the carry then adds to, and the courier slides out
+    // the front of the cabin at about 1.6 m/s. A much stiffer gain drains that
+    // faster than friction can fill it.
+    else if (this.grounded) gain = this.groundBody ? 40 : (hasInput ? 14 : 10);
     else gain = 2.6;                                      // air control
     if (this.knockTimer > 0) gain *= 0.15;
     const m = this.body.mass();

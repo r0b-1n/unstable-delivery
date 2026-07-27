@@ -8,10 +8,15 @@ import * as THREE from 'three';
 // an average hides exactly the hitching that makes a game feel bad, and one
 // 200 ms stall from a GC pause must not trigger a downgrade on its own.
 
+// lod0/lod1 are the terrain chunk detail radii in meters, and `detail` switches
+// the shadowless far scatter pools. On a 1600 m mountain those two are a bigger
+// lever than pixel ratio: dropping the far pines and pulling LOD0 in to 180 m
+// removes several hundred thousand triangles a frame without touching a pixel
+// the player is actually looking at.
 export const TIERS = [
-  { key: 'low', maxDpr: 1.0, bloom: false, shadowMap: 1024, samples: 0, shadows: true },
-  { key: 'medium', maxDpr: 1.5, bloom: true, shadowMap: 1024, samples: 2, shadows: true },
-  { key: 'high', maxDpr: 2.0, bloom: true, shadowMap: 2048, samples: 4, shadows: true },
+  { key: 'low', maxDpr: 1.0, bloom: false, shadowMap: 1024, samples: 0, shadows: true, lod0: 180, lod1: 480, detail: false },
+  { key: 'medium', maxDpr: 1.5, bloom: true, shadowMap: 1024, samples: 2, shadows: true, lod0: 260, lod1: 700, detail: true },
+  { key: 'high', maxDpr: 2.0, bloom: true, shadowMap: 2048, samples: 4, shadows: true, lod0: 320, lod1: 900, detail: true },
 ];
 
 const WINDOW = 120;
@@ -41,7 +46,11 @@ export class Quality {
   apply(tier) {
     this.tier = THREE.MathUtils.clamp(tier, 0, TIERS.length - 1);
     const t = this.current;
-    const { renderer, mood, post } = this.ctx;
+    const { renderer, mood, post, terrain } = this.ctx;
+    // Terrain does not exist yet on the first apply() — main.js re-applies once
+    // it does. Optional chaining here, an explicit re-apply there.
+    terrain?.setLodRadii(t.lod0, t.lod1);
+    terrain?.scatter.setDetail(t.detail);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, t.maxDpr));
     renderer.shadowMap.enabled = t.shadows;
     if (mood?.sun.shadow.mapSize.width !== t.shadowMap) {

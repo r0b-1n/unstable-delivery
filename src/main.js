@@ -35,7 +35,9 @@ app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 
-const camera = new THREE.PerspectiveCamera(68, window.innerWidth / window.innerHeight, 0.1, 1200);
+// far 8000, not 1200: the horizon range stands at up to 3 km and the sky dome
+// that has to enclose it is a 4600 m sphere centred on the courier.
+const camera = new THREE.PerspectiveCamera(68, window.innerWidth / window.innerHeight, 0.1, 8000);
 camera.position.set(0, 30, 60);
 
 window.addEventListener('resize', () => {
@@ -110,6 +112,9 @@ async function boot() {
   ctx.hud.boot('boot.terrain', 0.2);
   await yieldFrame();
   ctx.terrain = new Terrain(ctx);
+  // Quality ran its first apply() before the terrain existed, so the chunk LOD
+  // radii and the scatter detail flag never reached it. Re-apply now.
+  ctx.quality.apply(ctx.quality.tier);
 
   ctx.hud.boot('boot.props', 0.5);
   await yieldFrame();

@@ -1,10 +1,67 @@
 import * as THREE from 'three';
-import { BAND_KEYS, BAND_EDGES01, bandFloat, bandColor, bandOf, OBJ } from '../art/palette.js';
-import { InstancedPool } from '../art/instanced.js';
+import { BAND_KEYS, BAND_EDGES01, bandFloat, bandColor, OBJ } from '../art/palette.js';
+import { patchMaterial } from '../art/shaders.js';
+import { fbm, ridged, warp, rand2 } from './noise.js';
+import { PEAK, WORLD_R, KILL_Y, CELL, SIZE, SEGMENTS, W, LAKE, CIRQUE } from './dims.js';
+import { Scatter } from './scatter.js';
+import { Landmarks } from './landmarks.js';
+import { Backdrop } from './backdrop.js';
 
-export const PEAK = 170;          // summit height in meters
-export const WORLD_R = 240;       // half-extent of the terrain
-export const KILL_Y = -14;
+// Re-exported so the five modules that already say
+// `import { PEAK, KILL_Y } from '../world/terrain.js'` keep working.
+export { PEAK, WORLD_R, KILL_Y };
+
+// Visual chunking. 16x16 chunks of 100 m each: small enough that frustum
+// culling throws away most of the map, large enough that 256 draw calls is
+// still a rounding error next to what the scatter costs.
+const CHUNKS = 16;
+const CHUNK_CELLS = SEGMENTS / CHUNKS;    // 50 cells = 100 m
+const LOD_STRIDE = [1, 2, 5];             // must all divide CHUNK_CELLS
+const SKIRT = 6;                          // meters a chunk's edge apron drops
+
+// Massif shape.
+//
+// SHAPE_P is the exponent of the radial falloff and it is the single most
+// consequential number on the mountain. At 1.65 the profile sags: nearly all
+// the height sits inside a third of the radius and everything outside it is a
+// skirt under 7 % grade. Rendered, that is a cone standing on a dinner plate —
+// a mountain that is 1600 m wide and reads as 500 m wide, which defeats the
+// entire point of building it this big. At 1.15 the flank is close to straight
+// and the massif fills its own footprint.
+const SUMMIT_R = 700;   // radius at which the base profile reaches sea level
+const SHAPE_P = 1.15;
+const RIM0 = 690, RIM1 = 780;
+
+// Route. R_OUT follows SUMMIT_R outward: the depot has to stand where the
+// mountain is still near sea level, and with the fuller profile that is 640,
+// not 520. LOOPS comes down to keep the trail at ~3.8 km.
+const LOOPS = 1.85;
+const A0 = 0.8;
+const R_OUT = 640, R_IN = 20;
+const PATH_N = 1400;
+const TWO_PI = Math.PI * 2;
+
+const { clamp, smoothstep, lerp } = THREE.MathUtils;
+
+// The base profile, without noise. The trail's height curve is derived from
+// this same function so the route sits ON the mountain by construction instead
+// of being an independent curve that carve-and-fill has to reconcile.
+function baseProfile(r) {
+  return PEAK * Math.pow(clamp(1 - r / SUMMIT_R, 0, 1), SHAPE_P);
+}
+
+// The massif with its compass-angle modulation but no noise: the mountain's
+// mean surface. Used to derive heights that have to be known before the grid
+// exists — the lake's water level, above all.
+function massifAt(x, z) {
+  const th = Math.atan2(z, x);
+  const flank = 1 + 0.15 * Math.sin(th + 0.6) + 0.09 * Math.sin(th * 3 + 1.1);
+  return PEAK * Math.pow(clamp(1 - Math.hypot(x, z) / (SUMMIT_R * flank), 0, 1), SHAPE_P);
+}
+
+// Water level of the tarn, taken from the mean surface at its own centre so
+// that moving the lake never means re-tuning a hardcoded altitude.
+const LAKE_Y = massifAt(LAKE.x, LAKE.z) - 4;
 
 // Vertical difficulty bands, derived from the palette so the colour a player
 // sees and the zone the rules use can never drift apart. `name` is the English
@@ -23,77 +80,61 @@ export function zoneAt(y) {
   return ZONES[ZONES.length - 1];
 }
 
-// --- Tiny deterministic value noise --------------------------------------
-function hash2(x, y) {
-  let h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
-  return h - Math.floor(h);
-}
-function vnoise(x, y) {
-  const xi = Math.floor(x), yi = Math.floor(y);
-  const xf = x - xi, yf = y - yi;
-  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
-  const a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
-  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
-}
-function fbm(x, y) {
-  return vnoise(x, y) * 0.55 + vnoise(x * 2.7, y * 2.7) * 0.28 + vnoise(x * 6.1, y * 6.1) * 0.17;
-}
-
-const LOOPS = 3.25;
-const SEGMENTS = 150;
-const SIZE = WORLD_R * 2;
-
 export class Terrain {
   constructor(ctx) {
     this.ctx = ctx;
     this.islands = [];
+    this.chunks = [];
+    this.lakeLevel = LAKE_Y;
+    this.lod0R = 300;
+    this.lod1R = 850;
+    this._w = [0, 0];       // scratch for the domain warp
     this._computeGapWidths();
     this._buildPath();
-    this._buildMesh();
+    this._buildGrid();
+    this._buildChunks();
     this._buildCollider();
     this._buildIslands();
-    this._decorate();
+    // The map owns its own dressing: scatter, set pieces and horizon are all
+    // "the mountain" and none of them is meaningful to the rest of the game,
+    // so they hang off Terrain rather than adding three more members to ctx.
+    this.backdrop = new Backdrop(ctx, this);
+    this.landmarks = new Landmarks(ctx, this);
+    this.scatter = new Scatter(ctx, this);
   }
 
-  // The delivery route: a spiral shelf carved around the mountain.
+  // ---- Route -------------------------------------------------------------
+
   _buildPath() {
     this.pathSamples = [];
-    const N = 700;
-    for (let i = 0; i <= N; i++) {
-      const t = i / N;
-      const p = this.pathPoint(t);
-      this.pathSamples.push(p);
-    }
+    for (let i = 0; i <= PATH_N; i++) this.pathSamples.push(this.pathPoint(i / PATH_N));
   }
 
   // Chasms cut across the trail in the upper zones — jump them, ride a
   // mushroom out of them, or trust a crumbling plank. `m` is the physical
   // gap length in meters; every third gap (index 2, 5) is plank-less and
-  // sized to be sprint-jumpable. The t-space half-width `w` is derived from
-  // the local path speed at construction — a fixed t-width would make gaps
-  // WIDER near the base (large spiral radius) and trivial near the summit.
+  // sized to be sprint-jumpable — at SPRINT 10.8 and JUMP 11.2 against
+  // gravity 22 the air time is 1.02 s, so the reach is about 11 m. The two
+  // plank-less gaps are the only ones under that; the rest need the board.
+  // The t-space half-width `w` is derived from the local path speed at
+  // construction — a fixed t-width would make gaps WIDER near the base
+  // (large spiral radius) and trivial near the summit.
   static GAPS = [
-    { t: 0.415, m: 6 },
-    { t: 0.505, m: 6.5 },
-    { t: 0.585, m: 5 },
-    { t: 0.665, m: 7 },
-    { t: 0.735, m: 7.5 },
-    { t: 0.805, m: 5.5 },
-    { t: 0.875, m: 8 },
-    { t: 0.94, m: 8.5 },
+    { t: 0.415, m: 8 },
+    { t: 0.505, m: 9 },
+    { t: 0.585, m: 7 },
+    { t: 0.665, m: 10 },
+    { t: 0.735, m: 11 },
+    { t: 0.805, m: 8 },
+    { t: 0.875, m: 12 },
+    { t: 0.94, m: 13 },
   ];
 
   _computeGapWidths() {
-    const xz = (t) => {
-      const angle = t * LOOPS * Math.PI * 2 + 0.8;
-      const radius = 196 - Math.pow(t, 0.95) * 178;
-      return [Math.cos(angle) * radius, Math.sin(angle) * radius];
-    };
     for (const g of Terrain.GAPS) {
       const e = 0.001;
-      const [x0, z0] = xz(g.t - e);
-      const [x1, z1] = xz(g.t + e);
-      const speed = Math.hypot(x1 - x0, z1 - z0) / (2 * e); // meters per t
+      const a = pathXZ(g.t - e), b = pathXZ(g.t + e);
+      const speed = Math.hypot(b.x - a.x, b.z - a.z) / (2 * e); // meters per t
       g.w = (g.m / 2) / speed;
     }
   }
@@ -104,11 +145,13 @@ export class Terrain {
   }
 
   pathPoint(t) {
-    const angle = t * LOOPS * Math.PI * 2 + 0.8;
-    const radius = 196 - Math.pow(t, 0.95) * 178;
-    const h = PEAK * Math.pow(t, 1.25) * 0.97 + 1.5;
-    const width = 9.5 - t * 6.7; // 9.5 m at the base, 2.8 m near the summit
-    return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius, h, t, width, angle, gap: this.gapAt(t) };
+    const q = pathXZ(t);
+    return {
+      x: q.x, z: q.z, angle: q.angle, t,
+      h: baseProfile(q.base) + 1.5,
+      width: 9.5 - t * 6.3,         // 9.5 m at the depot, 3.2 m near the summit
+      gap: this.gapAt(t),
+    };
   }
 
   // Path sample a given number of METERS further up the trail from (x, z).
@@ -122,150 +165,460 @@ export class Terrain {
     return this.pathSamples[i];
   }
 
+  // Nearest point on the route. The old version scanned all 701 samples for
+  // every query, which cost 16 million iterations to build a 22 k-vertex mesh
+  // and would have cost 900 million to build this one.
+  //
+  // `angle(t) = t * LOOPS * 2PI + A0` is strictly monotonic, so it inverts:
+  // for a query at compass angle `th` the only candidates are the handful of
+  // `t` where the spiral crosses that bearing — one per loop. That gives the
+  // answer directly for anything plainly off-route, which is 95 % of the map,
+  // and a 60-sample local refinement handles the rest.
   _nearestPath(x, z) {
-    let best = 0, bestD = Infinity;
-    for (let i = 0; i < this.pathSamples.length; i++) {
+    const th = Math.atan2(z, x);
+    const span = LOOPS * TWO_PI;
+    let bestI = -1, bestD2 = Infinity;
+    for (let k = -1; k <= LOOPS + 1; k++) {
+      const tc = (th + TWO_PI * k - A0) / span;
+      if (tc < -0.02 || tc > 1.02) continue;
+      const i = clamp(Math.round(tc * PATH_N), 0, PATH_N);
       const p = this.pathSamples[i];
-      const dx = p.x - x, dz = p.z - z;
-      const d = dx * dx + dz * dz;
-      if (d < bestD) { bestD = d; best = i; }
+      const d2 = (p.x - x) * (p.x - x) + (p.z - z) * (p.z - z);
+      if (d2 < bestD2) { bestD2 = d2; bestI = i; }
     }
-    return { p: this.pathSamples[best], d: Math.sqrt(bestD), i: best };
-  }
-
-  _rawHeight(x, z) {
-    const r = Math.sqrt(x * x + z * z);
-    const base = PEAK * Math.pow(THREE.MathUtils.clamp(1 - r / 212, 0, 1), 1.7);
-    const frac = base / PEAK;
-    const amp = 3.5 + 30 * Math.pow(frac, 1.5);
-    const n = fbm(x * 0.021 + 13.7, z * 0.021 - 4.2);
-    const rim = THREE.MathUtils.smoothstep(r, 200, 236); // flatten to meadow at the rim
-    return (base + (n - 0.5) * 2 * amp) * (1 - rim);
-  }
-
-  _buildMesh() {
-    const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGMENTS, SEGMENTS);
-    geo.rotateX(-Math.PI / 2);
-    const pos = geo.attributes.position;
-    const count = pos.count;
-    const colors = new Float32Array(count * 3);
-    this.grid = new Float32Array((SEGMENTS + 1) * (SEGMENTS + 1));
-    const pathMixArr = new Float32Array(count);
-
-    // ---- Pass 1: heights ----
-    for (let i = 0; i < count; i++) {
-      const x = pos.getX(i), z = pos.getZ(i);
-      let h = this._rawHeight(x, z);
-
-      // Carve the spiral path into the slope — or a chasm where a gap cuts it.
-      const { p, d } = this._nearestPath(x, z);
-      let pathMix = 0;
-      const blend = 7;
-      if (p.gap) {
-        // Chasm: drop well below trail level so falling in costs real height.
-        const chasmH = p.h - 14;
-        if (d < p.width + 1.5) { h = Math.min(h, chasmH); }
-        else if (d < p.width + blend) {
-          const k = 1 - THREE.MathUtils.smoothstep(d - p.width - 1.5, 0, blend - 1.5);
-          h = Math.min(h, THREE.MathUtils.lerp(h, chasmH, k));
-        }
-      } else if (d < p.width) { h = p.h; pathMix = 1; }
-      else if (d < p.width + blend) {
-        const k = 1 - THREE.MathUtils.smoothstep(d - p.width, 0, blend);
-        h = THREE.MathUtils.lerp(h, p.h, k);
-        pathMix = k;
+    if (bestI < 0) return this._scanPath(x, z);
+    // Refine only near the trail. Further out the bearing-matched sample is
+    // already correct to within the sample spacing, and every consumer of a
+    // far-away answer only wants to know "not on the road".
+    if (bestD2 < 60 * 60) {
+      const lo = Math.max(0, bestI - 30), hi = Math.min(PATH_N, bestI + 30);
+      for (let i = lo; i <= hi; i++) {
+        const p = this.pathSamples[i];
+        const d2 = (p.x - x) * (p.x - x) + (p.z - z) * (p.z - z);
+        if (d2 < bestD2) { bestD2 = d2; bestI = i; }
       }
+    }
+    return { p: this.pathSamples[bestI], d: Math.sqrt(bestD2), i: bestI };
+  }
 
-      pos.setY(i, h);
-      this.grid[i] = h;
-      pathMixArr[i] = pathMix;
+  // Fallback for queries whose bearing yields no candidate inside [0,1] —
+  // essentially only the dead centre of the map.
+  _scanPath(x, z) {
+    let bestI = 0, bestD2 = Infinity;
+    for (let i = 0; i <= PATH_N; i += 4) {
+      const p = this.pathSamples[i];
+      const d2 = (p.x - x) * (p.x - x) + (p.z - z) * (p.z - z);
+      if (d2 < bestD2) { bestD2 = d2; bestI = i; }
+    }
+    return { p: this.pathSamples[bestI], d: Math.sqrt(bestD2), i: bestI };
+  }
+
+  // ---- Height field ------------------------------------------------------
+
+  // `calm` (1 on the trail, 0 well off it) suppresses the violent terms near
+  // the route. Without it the ridged noise swings +-90 m at altitude and the
+  // trail carve has to cut a 90 m trench to lay a shelf; with it the route
+  // reads as a bench cut into a flank rather than a canyon.
+  _rawHeight(x, z, calm) {
+    const w = warp(x, z, 55, 0.0026, this._w);
+    const wx = w[0], wz = w[1];
+    const r = Math.hypot(wx, wz);
+
+    // Asymmetric massif: the radial falloff is modulated by compass angle, so
+    // the mountain grows a broad south-west shoulder and a steep north face.
+    // This one term is what ends "identical from every direction".
+    const base = massifAt(wx, wz);
+    const frac = base / PEAK;
+    const wild = 1 - 0.8 * calm;
+    let h = base;
+
+    // Ridges. Amplitude still climbs with altitude, but far less steeply than
+    // before: at frac^1.35 the mid-mountain got 17 m of relief on a 500 m peak
+    // and the flanks read as a smooth heap of earth. The crests have to be
+    // legible from the valley, which is where they are looked at from.
+    h += (ridged(wx * 0.0042, wz * 0.0042) - 0.40) * (22 + 78 * Math.pow(frac, 0.9)) * wild;
+    // Broad undulation so the lower slopes are not a clean ramp.
+    h += (fbm(wx * 0.0085 + 13.7, wz * 0.0085 - 4.2) - 0.5) * (12 + 30 * frac);
+    // Fine relief at roughly the grid scale. Without it the finest feature on
+    // the mountain is 14 m across, every 2 m facet interpolates smoothly
+    // between its neighbours, and a meadow reads as moulded plastic. Suppressed
+    // near the trail, which is meant to be walkable rather than lumpy.
+    // calm^3, not calm: ridge suppression needs a 50 m halo around the trail,
+    // but flattening the fine relief that far out leaves a smooth moulded
+    // corridor down the whole route. Cubing pulls the flattening in tight to
+    // the road surface itself.
+    h += (fbm(wx * 0.055 + 61.3, wz * 0.055 - 17.9) - 0.5) * (1.4 + 2.2 * frac) * (1 - 0.8 * calm * calm * calm);
+
+    // Stratified benches through the middle of the mountain: a soft
+    // quantisation onto 15 m steps. Bedding planes read strongly on rock and
+    // give the cliff band the identity the palette already promises it.
+    // Strength 0.2, not 0.5, and the step is phase-shifted by noise. At half
+    // strength on a fixed 15 m grid the quantisation is a perfect contour: seen
+    // from the valley the entire upper mountain was a wedding cake, and crossed
+    // with the radial gullies it was a waffle. Terracing has to read as bedding
+    // that happens to be roughly horizontal, not as a lathe.
+    const terr = Math.max(0, 1 - Math.abs(frac - 0.5) * 4.6) * calmInv(calm);
+    if (terr > 0) {
+      const step = 13 + fbm(wx * 0.003 + 31, wz * 0.003 - 12) * 9;
+      const q = h / step, fl = Math.floor(q);
+      h = lerp(h, (fl + smoothstep(q - fl, 0.30, 0.80)) * step, terr * 0.2);
     }
 
-    // ---- Pass 2: colours, now slope- and curvature-aware ----
+    // Glacier cirque scooped out of the flank. The seracs in landmarks.js sit
+    // in this basin, which is why both read the same constants.
+    const cd = Math.hypot(x - CIRQUE.x, z - CIRQUE.z) / CIRQUE.r;
+    if (cd < 1) h -= CIRQUE.depth * Math.pow(1 - cd * cd, 1.5) * wild;
+
+    // The tarn. A dished basin held at a level derived from the mean surface,
+    // so the water plane above it always meets a shore rather than floating
+    // over a slope or drowning in one.
+    const ld = Math.hypot(x - LAKE.x, z - LAKE.z) / LAKE.r;
+    if (ld < 1.2) {
+      h = lerp(h, LAKE_Y - 6 * (1 - Math.min(ld, 1) ** 2), 1 - smoothstep(ld, 0.7, 1.2));
+    }
+
+    // Radial gullies. Sampling on the unit direction — times a radial term
+    // that bends them — keeps the channels running downhill, and unlike an
+    // atan2 term it leaves no seam along the +x axis.
+    const inv = 9 / (r + 1);
+    const chan = 1 - Math.abs(fbm(wx * inv + r * 0.0035, wz * inv + 7.3) - 0.5) * 2.6;
+    if (chan > 0) h -= chan * chan * 13 * frac * wild;
+
+    // Flatten to the water line at the rim.
+    return h * (1 - smoothstep(Math.hypot(x, z), RIM0, RIM1));
+  }
+
+  _buildGrid() {
+    const t0 = performance.now();
+    const grid = this.grid = new Float32Array(W * W);
+    const mix = new Float32Array(W * W);      // how much of each point is trail
+
+    // ---- Pass 1: heights + trail carve ----
+    for (let gz = 0; gz < W; gz++) {
+      const z = -WORLD_R + gz * CELL;
+      for (let gx = 0; gx < W; gx++) {
+        const x = -WORLD_R + gx * CELL;
+        const { p, d } = this._nearestPath(x, z);
+        const calm = 1 - smoothstep(d, 16, 52);
+        let h = this._rawHeight(x, z, calm);
+        let pathMix = 0;
+        // Asymmetric, like a real bench cut: a short blend where the trail is
+        // dug INTO the hillside, a long one where it is filled out over the
+        // drop. Symmetric at 6 m the shelf ended in a sheer face all the way
+        // round the spiral, and from a kilometre out the mountain wore a
+        // terrace ring nobody asked for.
+        const blend = h > p.h ? 9 : 15;
+        if (p.gap) {
+          // Chasm: drop well below trail level so falling in costs real height.
+          const chasmH = p.h - 20;
+          if (d < p.width + 1.5) h = Math.min(h, chasmH);
+          else if (d < p.width + blend) {
+            const k = 1 - smoothstep(d - p.width - 1.5, 0, blend - 1.5);
+            h = Math.min(h, lerp(h, chasmH, k));
+          }
+        } else if (d < p.width) { h = p.h; pathMix = 1; }
+        else if (d < p.width + blend) {
+          const k = 1 - smoothstep(d - p.width, 0, blend);
+          h = lerp(h, p.h, k);
+          pathMix = k;
+        }
+        const i = gz * W + gx;
+        grid[i] = h;
+        mix[i] = pathMix;
+      }
+    }
+
+    this._paintGrid(mix);
+    this.buildMs = performance.now() - t0;
+    console.info(`[terrain] ${W}x${W} grid in ${this.buildMs.toFixed(0)} ms`);
+  }
+
+  // ---- Pass 2: colour and rockiness, both slope-aware ----
+  _paintGrid(mix) {
+    const grid = this.grid;
+    const col8 = this._col = new Uint8Array(W * W * 3);
+    const rock8 = this._rock = new Uint8Array(W * W);
     const cFlower = [new THREE.Color(OBJ.liveryGold), new THREE.Color(0xff7bac), new THREE.Color(0xffffff)];
     const col = new THREE.Color();
-    const mix = new THREE.Color();
-    const W = SEGMENTS + 1;
-    const cell = SIZE / SEGMENTS;
+    const tmp = new THREE.Color();
 
-    for (let i = 0; i < count; i++) {
-      const x = pos.getX(i), z = pos.getZ(i);
-      const h = this.grid[i];
-      const gx = i % W, gz = (i / W) | 0;
-      const hx0 = this.grid[gz * W + Math.max(gx - 1, 0)], hx1 = this.grid[gz * W + Math.min(gx + 1, W - 1)];
-      const hz0 = this.grid[Math.max(gz - 1, 0) * W + gx], hz1 = this.grid[Math.min(gz + 1, W - 1) * W + gx];
-      const slope = Math.hypot(hx1 - hx0, hz1 - hz0) / (2 * cell);       // rise/run
-      const lap = (hx0 + hx1 + hz0 + hz1 - 4 * h) / cell;                 // concavity
-      const pathMix = pathMixArr[i];
+    for (let gz = 0; gz < W; gz++) {
+      for (let gx = 0; gx < W; gx++) {
+        const i = gz * W + gx;
+        const x = -WORLD_R + gx * CELL, z = -WORLD_R + gz * CELL;
+        const h = grid[i];
+        // Slope is measured over a 4 m baseline, not 2 m. It decides whether a
+        // face is bare rock, and the fine-relief octave above puts a metre of
+        // wobble on every vertex — on a one-cell stencil that wobble alone
+        // reads as a cliff and turns the whole meadow to scree.
+        const hx0 = grid[gz * W + Math.max(gx - 2, 0)], hx1 = grid[gz * W + Math.min(gx + 2, W - 1)];
+        const hz0 = grid[Math.max(gz - 2, 0) * W + gx], hz1 = grid[Math.min(gz + 2, W - 1) * W + gx];
+        const slope = Math.hypot(hx1 - hx0, hz1 - hz0) / (4 * CELL);
+        const lap = (hx0 + hx1 + hz0 + hz1 - 4 * h) / (2 * CELL);
 
-      // The jitter is what keeps a band edge from reading as a drawn contour
-      // line: it shuffles each vertex ±5 m across the 15 m-wide cross-fade.
-      const jitter = (fbm(x * 0.08, z * 0.08) - 0.5) * 10;
-      const band = bandFloat((h + jitter) / PEAK);
-      bandColor('terrainA', band, col);
-      bandColor('terrainB', band, mix);
-      col.lerp(mix, fbm(x * 0.11, z * 0.11));
-      // Flower speckle, fading out as the meadow gives way to pines.
-      if (band < 1) {
-        const f = hash2(Math.round(x * 2.1), Math.round(z * 2.1));
-        if (f > 0.965 && slope < 0.5) col.lerp(cFlower[(f * 977) % 3 | 0], 0.85 * (1 - band));
+        // The jitter is what keeps a band edge from reading as a drawn contour
+        // line: it shuffles each vertex across the cross-fade.
+        const jitter = (fbm(x * 0.03, z * 0.03) - 0.5) * 26;
+        const band = bandFloat((h + jitter) / PEAK);
+        bandColor('terrainA', band, col);
+        bandColor('terrainB', band, tmp);
+        col.lerp(tmp, fbm(x * 0.04, z * 0.04));
+
+        // Flower speckle, fading out as the meadow gives way to pines.
+        // Per-VERTEX, not per-noise-lobe. Sampling fbm at high frequency on a
+        // 2 m grid aliases into slow blobs, and the meadow ended up with metre-
+        // wide smears of pink across it rather than flowers.
+        if (band < 1) {
+          const f = rand2(Math.round(x * 2.1), Math.round(z * 2.1));
+          // Barely a tint. One coloured vertex on a smooth-shaded 2 m grid
+          // spreads across four square meters, so anything stronger than this
+          // paints dinner plates on the meadow rather than flowers. The actual
+          // flowers are instanced geometry in scatter.js.
+          if (f > 0.9 && slope < 0.5) col.lerp(cFlower[(f * 977) % 3 | 0], 0.22 * (1 - band));
+        }
+
+        // Snow only sticks where it is flat. In the two cold bands the slope
+        // threshold drops hard, so steep faces stay bare rock all the way to
+        // the summit — that single rule is the difference between a mountain
+        // under snow and a white cone.
+        const snowy = smoothstep(band, 2.4, 3.2);
+        const rockK = smoothstep(slope, lerp(0.85, 0.42, snowy), lerp(1.70, 1.05, snowy));
+        col.lerp(bandColor('rock', band, tmp), rockK * 0.9);
+
+        // Bedding planes on anything steep enough to read as a face. Cheapest
+        // possible geology, and it is legible at 200 m.
+        if (rockK > 0.3) {
+          const s = Math.sin(h * 0.62 + fbm(x * 0.02, z * 0.02) * 6) * 0.08;
+          col.multiplyScalar(1 + s * rockK);
+        }
+
+        // Crevice shading: concave areas darken, ridges brighten slightly.
+        col.multiplyScalar(clamp(1 + lap * 0.05 - Math.max(slope - 1.6, 0) * 0.12, 0.72, 1.12));
+
+        // Crisp trail. In the two cold bands `trail` is the only warm tone on
+        // the mountain — that, not brightness, keeps the path visible on snow.
+        // Opacity climbs with altitude: a faint track through the meadow that
+        // gives the band its name, fully opaque where it is the only thing
+        // telling you where the ground continues.
+        const pm = mix[i];
+        if (pm > 0.45) {
+          col.lerp(bandColor('trail', band, tmp),
+            Math.min((pm - 0.45) / 0.4, 1) * Math.min(0.30 + 0.17 * band, 0.95));
+        }
+
+        col8[i * 3] = col.r * 255; col8[i * 3 + 1] = col.g * 255; col8[i * 3 + 2] = col.b * 255;
+        rock8[i] = rockK * 255;
       }
-      // Steep faces expose the band's OWN rock everywhere above the meadows —
-      // one grey rock for the whole mountain flattens the palette back out.
-      if (h > 20) {
-        const rockK = THREE.MathUtils.smoothstep(slope, 0.85, 1.7);
-        col.lerp(bandColor('rock', band, mix), rockK * 0.85);
-      }
-      // Crevice shading: concave areas darken, ridges brighten slightly.
-      const shade = THREE.MathUtils.clamp(1 + lap * 0.05 - Math.max(slope - 1.6, 0) * 0.12, 0.72, 1.12);
-      col.multiplyScalar(shade);
-      // Crisp trail. In the two cold bands `trail` is the only warm tone on the
-      // mountain — that, not brightness, is what keeps the path visible on snow.
-      if (pathMix > 0.45) {
-        // Opacity climbs with altitude. Down in the meadow the route is obvious
-        // and a solid brown strip would bury the band that gives Sunny Meadows
-        // its name; on the summit the trail is the only thing telling you where
-        // the ground continues, so up there it goes fully opaque.
-        col.lerp(bandColor('trail', band, mix), Math.min((pathMix - 0.45) / 0.4, 1) * Math.min(0.52 + 0.13 * band, 0.95));
-      }
-      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
     }
-
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.95, metalness: 0 });
-    this.mesh = new THREE.Mesh(geo, mat);
-    this.mesh.receiveShadow = true;
-    this.mesh.castShadow = false;
-    this.ctx.scene.add(this.mesh);
   }
 
   heightAt(x, z) {
     const gx = ((x + WORLD_R) / SIZE) * SEGMENTS;
     const gz = ((z + WORLD_R) / SIZE) * SEGMENTS;
-    const x0 = THREE.MathUtils.clamp(Math.floor(gx), 0, SEGMENTS - 1);
-    const z0 = THREE.MathUtils.clamp(Math.floor(gz), 0, SEGMENTS - 1);
+    const x0 = clamp(Math.floor(gx), 0, SEGMENTS - 1);
+    const z0 = clamp(Math.floor(gz), 0, SEGMENTS - 1);
     const fx = gx - x0, fz = gz - z0;
-    const w = SEGMENTS + 1;
-    const h00 = this.grid[z0 * w + x0], h10 = this.grid[z0 * w + x0 + 1];
-    const h01 = this.grid[(z0 + 1) * w + x0], h11 = this.grid[(z0 + 1) * w + x0 + 1];
-    return THREE.MathUtils.lerp(THREE.MathUtils.lerp(h00, h10, fx), THREE.MathUtils.lerp(h01, h11, fx), fz);
+    const h00 = this.grid[z0 * W + x0], h10 = this.grid[z0 * W + x0 + 1];
+    const h01 = this.grid[(z0 + 1) * W + x0], h11 = this.grid[(z0 + 1) * W + x0 + 1];
+    return lerp(lerp(h00, h10, fx), lerp(h01, h11, fx), fz);
   }
+
+  // Rise over run at a world position. Scatter asks this a hundred thousand
+  // times, so it reads the grid directly rather than calling heightAt four
+  // times and paying for four bilinear interpolations.
+  slopeAt(x, z) {
+    const gx = clamp(Math.round((x + WORLD_R) / CELL), 1, W - 2);
+    const gz = clamp(Math.round((z + WORLD_R) / CELL), 1, W - 2);
+    const g = this.grid;
+    return Math.hypot(g[gz * W + gx + 1] - g[gz * W + gx - 1],
+      g[(gz + 1) * W + gx] - g[(gz - 1) * W + gx]) / (2 * CELL);
+  }
+
+  // ---- Visual chunks -----------------------------------------------------
+
+  _buildChunks() {
+    this.mesh = new THREE.Group();
+    this.mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0 });
+    // Smooth base normals, flat facets only where the vertex says "rock". Grass
+    // and snowfields flow; faces and ridgelines stay hard.
+    patchMaterial(this.mat, { faceBlend: true });
+
+    const start = this.pathPoint(0.02);
+    for (let cz = 0; cz < CHUNKS; cz++) {
+      for (let cx = 0; cx < CHUNKS; cx++) {
+        const c = {
+          cx, cz, lod: -1, mesh: null,
+          x: -WORLD_R + (cx + 0.5) * CHUNK_CELLS * CELL,
+          z: -WORLD_R + (cz + 0.5) * CHUNK_CELLS * CELL,
+        };
+        this.chunks.push(c);
+        this._applyLod(c, this._lodFor(c, start.x, start.z));
+      }
+    }
+    this.ctx.scene.add(this.mesh);
+  }
+
+  _lodFor(c, camX, camZ) {
+    const d = Math.hypot(c.x - camX, c.z - camZ);
+    // Hysteresis: a chunk sitting exactly on a boundary must not rebuild every
+    // frame as the camera breathes.
+    const slack = c.lod < 0 ? 0 : 0.12;
+    if (d < this.lod0R * (c.lod === 0 ? 1 + slack : 1)) return 0;
+    if (d < this.lod1R * (c.lod <= 1 ? 1 + slack : 1)) return 1;
+    return 2;
+  }
+
+  _applyLod(c, lod) {
+    if (c.lod === lod) return;
+    const geo = this._chunkGeometry(c.cx, c.cz, lod);
+    if (c.mesh) {
+      c.mesh.geometry.dispose();
+      c.mesh.geometry = geo;
+    } else {
+      c.mesh = new THREE.Mesh(geo, this.mat);
+      c.mesh.receiveShadow = true;
+      c.mesh.castShadow = false;
+      this.mesh.add(c.mesh);
+    }
+    c.lod = lod;
+  }
+
+  _chunkGeometry(cx, cz, lod) {
+    const stride = LOD_STRIDE[lod];
+    const n = CHUNK_CELLS / stride;
+    const vw = n + 1;
+    const core = vw * vw;
+    const total = core + 4 * vw;             // core grid plus a skirt per edge
+    const pos = new Float32Array(total * 3);
+    const nor = new Float32Array(total * 3);
+    const col = new Float32Array(total * 3);
+    const rk = new Float32Array(total);
+    const grid = this.grid, col8 = this._col, rock8 = this._rock;
+
+    // Normals come from the FULL-resolution grid at every LOD. That costs
+    // nothing extra and buys the one thing that matters: when a chunk swaps
+    // detail level its lighting does not change, so the geometry pop is a
+    // silhouette shift rather than a flash across the whole surface.
+    const put = (vi, gx, gz, drop) => {
+      const i = gz * W + gx;
+      pos[vi * 3] = -WORLD_R + gx * CELL;
+      pos[vi * 3 + 1] = grid[i] - drop;
+      pos[vi * 3 + 2] = -WORLD_R + gz * CELL;
+      const hx0 = grid[gz * W + Math.max(gx - 1, 0)], hx1 = grid[gz * W + Math.min(gx + 1, W - 1)];
+      const hz0 = grid[Math.max(gz - 1, 0) * W + gx], hz1 = grid[Math.min(gz + 1, W - 1) * W + gx];
+      const nx = hx0 - hx1, ny = 2 * CELL, nz = hz0 - hz1;
+      const len = Math.hypot(nx, ny, nz) || 1;
+      nor[vi * 3] = nx / len; nor[vi * 3 + 1] = ny / len; nor[vi * 3 + 2] = nz / len;
+      col[vi * 3] = col8[i * 3] / 255;
+      col[vi * 3 + 1] = col8[i * 3 + 1] / 255;
+      col[vi * 3 + 2] = col8[i * 3 + 2] / 255;
+      rk[vi] = rock8[i] / 255;
+    };
+
+    const gx0 = cx * CHUNK_CELLS, gz0 = cz * CHUNK_CELLS;
+    let vi = 0;
+    for (let jz = 0; jz < vw; jz++) {
+      for (let jx = 0; jx < vw; jx++) put(vi++, gx0 + jx * stride, gz0 + jz * stride, 0);
+    }
+
+    const idx = [];
+    for (let jz = 0; jz < n; jz++) {
+      for (let jx = 0; jx < n; jx++) {
+        const a = jz * vw + jx, b = a + 1, c = a + vw, d = c + 1;
+        idx.push(a, c, b, b, c, d);
+      }
+    }
+
+    // Skirts. Neighbouring chunks at different LODs leave T-junctions along
+    // their shared edge; a 6 m apron hanging off every border hides the pinhole
+    // without any of the stitching bookkeeping a seamless solution needs.
+    // Both windings are emitted: which way a given edge faces depends on the
+    // chunk's position on the map, and 1200 extra indices is cheaper than
+    // being wrong about it.
+    const edges = [
+      { fx: (j) => gx0 + j * stride, fz: () => gz0 },
+      { fx: (j) => gx0 + j * stride, fz: () => gz0 + CHUNK_CELLS },
+      { fx: () => gx0, fz: (j) => gz0 + j * stride },
+      { fx: () => gx0 + CHUNK_CELLS, fz: (j) => gz0 + j * stride },
+    ];
+    const coreIndexOf = [
+      (j) => j,                        // top row
+      (j) => n * vw + j,               // bottom row
+      (j) => j * vw,                   // left column
+      (j) => j * vw + n,               // right column
+    ];
+    edges.forEach((e, ei) => {
+      const base = vi;
+      for (let j = 0; j < vw; j++) put(vi++, e.fx(j), e.fz(j), SKIRT);
+      for (let j = 0; j < n; j++) {
+        const a = coreIndexOf[ei](j), b = coreIndexOf[ei](j + 1);
+        const c = base + j, d = base + j + 1;
+        idx.push(a, c, b, b, c, d, a, b, c, b, d, c);
+      }
+    });
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setAttribute('aRock', new THREE.BufferAttribute(rk, 1));
+    geo.setIndex(idx);
+    geo.computeBoundingSphere();
+    return geo;
+  }
+
+  // Called every frame: pull nearby chunks up to detail, push far ones down.
+  // Budgeted, because rebuilding a 2601-vertex geometry is cheap but rebuilding
+  // forty of them in one frame is not.
+  _updateLod() {
+    const cam = this.ctx.camera.position;
+    let budget = 2;
+    // Nearest-first, so walking into a region resolves the ground you are about
+    // to stand on before the scenery behind it.
+    let cands = null;
+    for (const c of this.chunks) {
+      const want = this._lodFor(c, cam.x, cam.z);
+      if (want === c.lod) continue;
+      (cands ??= []).push(c);
+    }
+    if (!cands) return;
+    cands.sort((a, b) => (a.x - cam.x) ** 2 + (a.z - cam.z) ** 2 - ((b.x - cam.x) ** 2 + (b.z - cam.z) ** 2));
+    for (const c of cands) {
+      if (budget-- <= 0) break;
+      this._applyLod(c, this._lodFor(c, cam.x, cam.z));
+    }
+  }
+
+  setLodRadii(r0, r1) {
+    this.lod0R = r0;
+    this.lod1R = r1;
+  }
+
+  // ---- Collider ----------------------------------------------------------
 
   _buildCollider() {
     const { physics } = this.ctx;
     const R = physics.RAPIER;
-    const geo = this.mesh.geometry;
-    const vertices = new Float32Array(geo.attributes.position.array);
-    const indices = new Uint32Array(geo.index.array);
+    // Rapier wants the height matrix COLUMN-major; our grid is row-major. Get
+    // this backwards and the collider is the terrain mirrored about its
+    // diagonal — no crash, no warning, just a world where the ground is not
+    // where it is drawn. scripts/verify.mjs probes for exactly this.
+    const heights = new Float32Array(W * W);
+    for (let gz = 0; gz < W; gz++) {
+      for (let gx = 0; gx < W; gx++) heights[gx * W + gz] = this.grid[gz * W + gx];
+    }
     const body = physics.world.createRigidBody(R.RigidBodyDesc.fixed());
-    const desc = R.ColliderDesc.trimesh(vertices, indices).setFriction(0.85);
+    const desc = R.ColliderDesc
+      .heightfield(SEGMENTS, SEGMENTS, heights, { x: SIZE, y: 1, z: SIZE },
+        R.HeightFieldFlags?.FIX_INTERNAL_EDGES)
+      .setFriction(0.85);
     this.collider = physics.world.createCollider(desc, body);
   }
 
-  // Floating islands: the last stretch to the summit is an island-hopping
-  // gauntlet. They bob and drift — everything up here is barely attached to reality.
+  // ---- Floating islands --------------------------------------------------
+
+  // The last stretch to the summit is an island-hopping gauntlet. They bob and
+  // drift — everything up here is barely attached to reality.
   _buildIslands() {
     const { physics, scene } = this.ctx;
     const R = physics.RAPIER;
@@ -278,12 +631,12 @@ export class Terrain {
     for (let i = 0; i < n; i++) {
       const k = (i + 1) / n;
       const a = end.angle + 0.9 + k * 3.4;
-      const r = 26 + Math.sin(i * 2.4) * 9;
+      const r = 40 + Math.sin(i * 2.4) * 14;
       defs.push({
         x: Math.cos(a) * r * (1 - k * 0.75),
         z: Math.sin(a) * r * (1 - k * 0.75),
-        y: end.h + 6 + k * 22,
-        s: i === n - 1 ? 9 : 4.2 - k * 1.2, // last one is the summit island
+        y: end.h + 9 + k * 34,
+        s: i === n - 1 ? 11 : 5.4 - k * 1.5,
         phase: i * 1.7,
         bob: i === n - 1 ? 0.6 : 1.6,
       });
@@ -308,225 +661,15 @@ export class Terrain {
 
       const isl = { group, body, base: new THREE.Vector3(d.x, d.y, d.z), phase: d.phase, bob: d.bob, radius: d.s };
       this.islands.push(isl);
-      if (d.s > 6) this.summitIsland = isl;
-    }
-  }
-
-  _decorate() {
-    const { scene, physics } = this.ctx;
-    const R = physics.RAPIER;
-    const staticBody = physics.world.createRigidBody(R.RigidBodyDesc.fixed());
-
-    // Pine trees (forest band) — instanced cones + trunks, cylinder colliders.
-    const treeGeo = new THREE.ConeGeometry(1.9, 5.2, 6);
-    const treeMat = new THREE.MeshStandardMaterial({ color: bandOf('forest').veg, flatShading: true, roughness: 0.9 });
-    const trunkGeo = new THREE.CylinderGeometry(0.35, 0.45, 2.2, 5);
-    const trunkMat = new THREE.MeshStandardMaterial({ color: OBJ.timberDark, flatShading: true, roughness: 0.95 });
-    const trees = new THREE.InstancedMesh(treeGeo, treeMat, 90);
-    const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, 90);
-    trees.castShadow = trunks.castShadow = true;
-    const m = new THREE.Matrix4();
-    let placed = 0;
-    for (let i = 0; i < 600 && placed < 90; i++) {
-      const a = hash2(i, 7.7) * Math.PI * 2;
-      const r = 90 + hash2(i, 3.1) * 110;
-      const x = Math.cos(a) * r, z = Math.sin(a) * r;
-      const h = this.heightAt(x, z);
-      if (h < 14 || h > 58) continue;
-      const near = this._nearestPath(x, z);
-      if (near.d < near.p.width + 3) continue; // keep the road clear
-      const s = 0.8 + hash2(i, 9.2) * 0.7;
-      m.makeScale(s, s, s).setPosition(x, h + 3.2 * s, z);
-      trees.setMatrixAt(placed, m);
-      m.makeScale(s, s, s).setPosition(x, h + 1.0 * s, z);
-      trunks.setMatrixAt(placed, m);
-      physics.world.createCollider(
-        R.ColliderDesc.cylinder(2.8 * s, 0.45 * s).setTranslation(x, h + 2.8 * s, z),
-        staticBody,
-      );
-      placed++;
-    }
-    trees.count = trunks.count = placed;
-    scene.add(trees, trunks);
-
-    // Scattered boulders-as-decor (static) in the cliff band.
-    const rockGeo = new THREE.DodecahedronGeometry(1.4, 0);
-    // Decor boulders take the cliff band's own rock — warm and clearly NOT
-    // `OBJ.hazardRock`, so scenery never gets mistaken for something incoming.
-    const rockMat = new THREE.MeshStandardMaterial({ color: bandOf('cliffs').rock, flatShading: true, roughness: 1 });
-    const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 46);
-    rocks.castShadow = rocks.receiveShadow = true;
-    let rp = 0;
-    for (let i = 0; i < 500 && rp < 46; i++) {
-      const a = hash2(i, 17.3) * Math.PI * 2;
-      const r = 40 + hash2(i, 23.9) * 140;
-      const x = Math.cos(a) * r, z = Math.sin(a) * r;
-      const h = this.heightAt(x, z);
-      if (h < 40 || h > 140) continue;
-      const near = this._nearestPath(x, z);
-      if (near.d < near.p.width + 2) continue;
-      const s = 0.7 + hash2(i, 31.7) * 1.8;
-      m.makeRotationY(hash2(i, 5) * 6).scale(new THREE.Vector3(s, s * 0.8, s)).setPosition(x, h + 0.6 * s, z);
-      rocks.setMatrixAt(rp, m);
-      physics.world.createCollider(R.ColliderDesc.ball(1.15 * s).setTranslation(x, h + 0.6 * s, z), staticBody);
-      rp++;
-    }
-    rocks.count = rp;
-    scene.add(rocks);
-
-    // Glowing crystals near the summit — pure fantasy set dressing.
-    const cryGeo = new THREE.OctahedronGeometry(1.1, 0);
-    const cryMat = new THREE.MeshStandardMaterial({ color: OBJ.emCrystalBody, emissive: OBJ.emCrystal, emissiveIntensity: 1.4, flatShading: true, roughness: 0.3 });
-    this.crystals = [];
-    for (let i = 0; i < 14; i++) {
-      const a = hash2(i, 43.1) * Math.PI * 2;
-      const r = 12 + hash2(i, 47.7) * 55;
-      const x = Math.cos(a) * r, z = Math.sin(a) * r;
-      const h = this.heightAt(x, z);
-      if (h < PEAK * 0.7) continue;
-      const c = new THREE.Mesh(cryGeo, cryMat);
-      const s = 0.7 + hash2(i, 51) * 1.3;
-      c.scale.set(s, s * (1.4 + hash2(i, 3) * 0.8), s);
-      c.position.set(x, h + s, z);
-      c.rotation.y = hash2(i, 8) * 6;
-      scene.add(c);
-      this.crystals.push(c);
-    }
-
-    // --- Sea around the mountain base: low-poly waves via vertex shader hook ---
-    const seaGeo = new THREE.RingGeometry(200, 900, 48, 6);
-    seaGeo.rotateX(-Math.PI / 2);
-    const seaMat = new THREE.MeshStandardMaterial({
-      color: OBJ.sea, roughness: 0.35, metalness: 0.1, flatShading: true,
-      transparent: true, opacity: 0.96,
-    });
-    seaMat.onBeforeCompile = (sh) => {
-      sh.uniforms.uTime = { value: 0 };
-      sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', '#include <common>\nuniform float uTime;')
-        .replace('#include <begin_vertex>',
-          `#include <begin_vertex>
-           transformed.y += sin(position.x * 0.05 + uTime * 1.1) * 0.55 + cos(position.z * 0.06 + uTime * 0.8) * 0.45;`);
-      this._seaShader = sh;
-    };
-    const sea = new THREE.Mesh(seaGeo, seaMat);
-    sea.position.y = 0.5;
-    scene.add(sea);
-
-    // --- Lanterns lining the trail (emissive, no per-light cost) ---
-    const poleGeo = new THREE.CylinderGeometry(0.06, 0.08, 1.7, 4);
-    const poleMat = new THREE.MeshStandardMaterial({ color: OBJ.timberDark, flatShading: true });
-    const lampGeo = new THREE.SphereGeometry(0.17, 6, 5);
-    const lampMat = new THREE.MeshStandardMaterial({ color: OBJ.liveryGold, emissive: OBJ.emLantern, emissiveIntensity: 2.2 });
-    const nLan = 46;
-    const poles = new THREE.InstancedMesh(poleGeo, poleMat, nLan);
-    const lamps = new THREE.InstancedMesh(lampGeo, lampMat, nLan);
-    let li = 0;
-    for (let k = 0; k < nLan; k++) {
-      const t = 0.02 + (k / nLan) * 0.95;
-      if (this.gapAt(t)) continue;
-      const p = this.pathPoint(t);
-      const len = Math.hypot(p.x, p.z) || 1;
-      const x = p.x + (p.x / len) * (p.width + 1.2);
-      const z = p.z + (p.z / len) * (p.width + 1.2);
-      const h = this.heightAt(x, z);
-      if (Math.abs(h - p.h) > 4) continue; // off a cliff edge — skip
-      m.identity().setPosition(x, h + 0.85, z);
-      poles.setMatrixAt(li, m);
-      m.identity().setPosition(x, h + 1.8, z);
-      lamps.setMatrixAt(li, m);
-      li++;
-    }
-    poles.count = lamps.count = li;
-    scene.add(poles, lamps);
-
-    // --- Grass tufts + meadow detail ---
-    const tuftGeo = new THREE.ConeGeometry(0.16, 0.55, 4);
-    const tuftMat = new THREE.MeshStandardMaterial({ color: bandOf('meadow').veg, flatShading: true });
-    const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, 320);
-    let ti = 0;
-    for (let i = 0; i < 2200 && ti < 320; i++) {
-      const a = hash2(i, 91.3) * Math.PI * 2;
-      const r = 120 + hash2(i, 93.7) * 115;
-      const x = Math.cos(a) * r, z = Math.sin(a) * r;
-      const h = this.heightAt(x, z);
-      if (h < 0.8 || h > 22) continue;
-      const s = 0.8 + hash2(i, 97.1) * 1.3;
-      m.makeScale(s, s * (0.8 + hash2(i, 5.5)), s).setPosition(x, h + 0.22 * s, z);
-      tufts.setMatrixAt(ti, m);
-      ti++;
-    }
-    tufts.count = ti;
-    scene.add(tufts);
-
-    // --- Snowy pines up high ---
-    const spineGeo = new THREE.ConeGeometry(1.6, 4.4, 6);
-    const spineMat = new THREE.MeshStandardMaterial({ color: bandOf('frozen').veg, flatShading: true });
-    const scapGeo = new THREE.ConeGeometry(1.15, 1.7, 6);
-    const scapMat = new THREE.MeshStandardMaterial({ color: OBJ.snowCap, flatShading: true });
-    const spines = new THREE.InstancedMesh(spineGeo, spineMat, 40);
-    const scaps = new THREE.InstancedMesh(scapGeo, scapMat, 40);
-    spines.castShadow = true;
-    let si = 0;
-    for (let i = 0; i < 900 && si < 40; i++) {
-      const a = hash2(i, 111.3) * Math.PI * 2;
-      const r = 30 + hash2(i, 113.9) * 110;
-      const x = Math.cos(a) * r, z = Math.sin(a) * r;
-      const h = this.heightAt(x, z);
-      if (h < 95 || h > 145) continue;
-      const near = this._nearestPath(x, z);
-      if (near.d < near.p.width + 2) continue;
-      const s = 0.7 + hash2(i, 117.2) * 0.6;
-      m.makeScale(s, s, s).setPosition(x, h + 2.2 * s, z);
-      spines.setMatrixAt(si, m);
-      m.makeScale(s, s, s).setPosition(x, h + 4.4 * s, z);
-      scaps.setMatrixAt(si, m);
-      si++;
-    }
-    spines.count = scaps.count = si;
-    scene.add(spines, scaps);
-
-    // --- Birds circling thermals ---
-    this.birds = [];
-    const birdGeo = new THREE.ConeGeometry(0.25, 0.9, 3);
-    birdGeo.rotateX(Math.PI / 2);
-    const birdMat = new THREE.MeshStandardMaterial({ color: OBJ.bird, flatShading: true });
-    for (let f = 0; f < 3; f++) {
-      const cx = Math.cos(f * 2.1) * (60 + f * 40);
-      const cz = Math.sin(f * 2.1) * (60 + f * 40);
-      const cy = 40 + f * 45;
-      for (let b = 0; b < 4; b++) {
-        const mesh = new THREE.Mesh(birdGeo, birdMat);
-        scene.add(mesh);
-        this.birds.push({ mesh, cx, cz, cy, r: 9 + b * 2.5, phase: b * 1.6 + f, speed: 0.5 + hash2(f, b) * 0.3 });
-      }
-    }
-
-    // Drifting low-poly clouds. Every blob used to build its OWN
-    // IcosahedronGeometry — 60-odd transparent draw calls for set dressing.
-    // One unit icosahedron scaled per instance gives the identical silhouette.
-    this.clouds = [];
-    const cloudMat = new THREE.MeshStandardMaterial({ color: OBJ.cloud, flatShading: true, roughness: 1, transparent: true, opacity: 0.92 });
-    this._cloudPool = new InstancedPool(scene, new THREE.IcosahedronGeometry(1, 0), cloudMat, 80, { castShadow: false, dynamic: true });
-    for (let i = 0; i < 12; i++) {
-      const blobs = 2 + ((hash2(i, 61) * 3) | 0);
-      const parts = [];
-      for (let b = 0; b <= blobs; b++) {
-        const r = 3 + hash2(i, b) * 4;
-        const proxy = this._cloudPool.obtain();
-        proxy.scale.set(r, r * 0.55, r);
-        parts.push({ proxy, ox: b * 4 - blobs * 2, oy: hash2(b, i) * 2, oz: hash2(i * 3, b) * 3 });
-      }
-      const a = hash2(i, 71) * Math.PI * 2;
-      const r = 60 + hash2(i, 73) * 160;
-      this.clouds.push({
-        pos: new THREE.Vector3(Math.cos(a) * r, 60 + hash2(i, 79) * 130, Math.sin(a) * r),
-        parts, speed: 1 + hash2(i, 83) * 2.5,
-      });
+      if (d.s > 8) this.summitIsland = isl;
     }
   }
 
   update(dt, t) {
+    this._updateLod();
+    this.backdrop.update(dt, t);
+    this.scatter.update(dt, t);
+    this.landmarks.update(dt, t);
     // Bobbing islands (kinematic so they carry the player).
     for (const isl of this.islands) {
       const y = isl.base.y + Math.sin(t * 0.6 + isl.phase) * isl.bob;
@@ -534,21 +677,23 @@ export class Terrain {
       isl.body.setNextKinematicTranslation({ x, y, z: isl.base.z });
       isl.group.position.set(x, y, isl.base.z);
     }
-    for (const c of this.crystals) c.rotation.y += dt * 0.4;
-    for (const c of this.clouds) {
-      c.pos.x += c.speed * dt;
-      if (c.pos.x > WORLD_R + 60) c.pos.x = -WORLD_R - 60;
-      for (const p of c.parts) p.proxy.position.set(c.pos.x + p.ox, c.pos.y + p.oy, c.pos.z + p.oz);
-    }
-    this._cloudPool.flush();
-    if (this._seaShader) this._seaShader.uniforms.uTime.value = t;
-    for (const b of this.birds) {
-      const a = t * b.speed + b.phase;
-      const nx = b.cx + Math.cos(a) * b.r;
-      const nz = b.cz + Math.sin(a) * b.r;
-      const ny = b.cy + Math.sin(t * 0.7 + b.phase) * 2;
-      b.mesh.lookAt(nx, ny, nz);
-      b.mesh.position.set(nx, ny, nz);
-    }
   }
+}
+
+// Route geometry without the gap lookup, so gap widths can be measured from it
+// during construction before any gap exists.
+function pathXZ(t) {
+  const angle = t * LOOPS * TWO_PI + A0;
+  const base = R_OUT + (R_IN - R_OUT) * Math.pow(t, 0.95);
+  // The trail bulges in and out instead of drawing one lazy arc, and wobbles
+  // harder on the steep upper flank where a clean traverse would read as a
+  // drawn line rather than a path someone wore into a mountain.
+  const wob = 0.045 + 0.055 * smoothstep(t, 0.42, 0.78);
+  const radius = base * (1 + wob * Math.sin(t * 41) + wob * 0.6 * Math.sin(t * 17 + 1.7));
+  return { x: Math.cos(angle) * radius, z: Math.sin(angle) * radius, angle, base };
+}
+
+// Terracing is suppressed near the trail along with everything else violent.
+function calmInv(calm) {
+  return 1 - 0.7 * calm;
 }

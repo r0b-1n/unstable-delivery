@@ -29,31 +29,31 @@ export const BLEND = 0.045;
 const BANDS = [
   { // meadow
     terrainA: 0x5b9b31, terrainB: 0xa2ce3b, rock: 0x897258, veg: 0x287132, trail: 0x8c6736,
-    fog: 0xf1e2c6, fogNear: 110, fogFar: 640,
+    fog: 0xf1e2c6, fogNear: 190, fogFar: 2300,
     skyTop: 0x3e94e0, skyHorizon: 0xf5e7cc,
     sun: 0xefc680, sunI: 2.3, hemiSky: 0xa5cde9, hemiGround: 0x6e964a, hemiI: 1.25,
   },
   { // forest
     terrainA: 0x2e763c, terrainB: 0x4e9c3a, rock: 0x786654, veg: 0x224f38, trail: 0x7b5932,
-    fog: 0xbedee4, fogNear: 95, fogFar: 560,
+    fog: 0xbedee4, fogNear: 170, fogFar: 2050,
     skyTop: 0x3185d8, skyHorizon: 0xc1e0eb,
     sun: 0xe8d19c, sunI: 2.2, hemiSky: 0xa0c6e4, hemiGround: 0x406d46, hemiI: 1.2,
   },
   { // cliffs
     terrainA: 0x917959, terrainB: 0xb0886d, rock: 0x6a5a4d, veg: 0x536a44, trail: 0x684b31,
-    fog: 0xb5c8d9, fogNear: 80, fogFar: 480,
+    fog: 0xb5c8d9, fogNear: 150, fogFar: 1750,
     skyTop: 0x2f6cbc, skyHorizon: 0xb2cadc,
     sun: 0xe5dbbd, sunI: 2.05, hemiSky: 0x95b8da, hemiGround: 0x786654, hemiI: 1.12,
   },
   { // frozen
     terrainA: 0xa6c6d3, terrainB: 0xdae0e7, rock: 0x586274, veg: 0x31544d, trail: 0xae8a5b,
-    fog: 0xadbfcd, fogNear: 55, fogFar: 360,
+    fog: 0xadbfcd, fogNear: 110, fogFar: 1350,
     skyTop: 0x34558d, skyHorizon: 0x9fb3c6,
     sun: 0xd2dde5, sunI: 1.8, hemiSky: 0x89a6c8, hemiGround: 0x8da1b0, hemiI: 1.0,
   },
   { // summit
     terrainA: 0xe1e5ea, terrainB: 0xf4f4f6, rock: 0x424857, veg: 0x3f5a58, trail: 0xb49474,
-    fog: 0x6f7d9b, fogNear: 30, fogFar: 230,
+    fog: 0x6f7d9b, fogNear: 70, fogFar: 950,
     skyTop: 0x1b1f37, skyHorizon: 0x5e6f8d,
     sun: 0xb6c2d8, sunI: 1.5, hemiSky: 0x53618d, hemiGround: 0x818c9c, hemiI: 0.88,
   },
@@ -75,6 +75,10 @@ export const OBJ = {
   timberMid: 0x8a6238,    // planks, seesaws, pads
   plankPale: 0x9a7040,
 
+  // bandOf('forest').veg is the GROUND under a forest and is nearly black; a
+  // canopy painted with it reads as a hole punched in the mountain whenever the
+  // sun is behind the tree, which on a spiral route is half the time.
+  pineNeedle: 0x3f7f4a,
   mushroomStem: 0xf2e7cf,
   mushroomCap: 0xe8443f,  // darker than before so it stays under the bloom threshold
   mushroomDots: 0xffffff,
