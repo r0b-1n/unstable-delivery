@@ -1,0 +1,55 @@
+name: E2E
+
+# deploy.yml only curl-checks that Pages serves the built bundle. This is the actual
+# gameplay regression suite (25 checks + a console-error gate) and it runs on every push.
+# Push covers same-repo PR branches too, so there is no pull_request trigger and no
+# duplicate runs.
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+
+      # vite preview serves dist/ the way Pages does, so base:'./' and the asset
+      # paths get exercised for real instead of through the dev server.
+      - name: Start preview server
+        run: |
+          npx vite preview --port 4173 &
+          for i in $(seq 1 40); do
+            curl -sf http://localhost:4173/ >/dev/null && echo "preview up" && exit 0
+            sleep 1
+          done
+          echo "::error::preview server did not come up"
+          exit 1
+
+      - name: Run E2E suite
+        env:
+          GAME_URL: http://localhost:4173/
+        run: npm run verify
+
+      # The suite writes ~10 screenshots. They are the only way to eyeball an art
+      # regression from a CI log, so keep them even when the run passes.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-screenshots-${{ github.run_number }}
+          path: verify-out/
+          retention-days: 14
+          if-no-files-found: warn

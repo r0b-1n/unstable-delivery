@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJ } from '../art/palette.js';
+import { patchMaterial } from '../art/shaders.js';
 
 // The courier model ships as ONE fused static mesh (no skeleton). We split it
 // into body parts at load time by triangle position — head, torso, arms, legs
@@ -34,12 +36,12 @@ export class Character {
 
   _buildChute() {
     // Parcel-parachute: cardboard glider that pops open mid-air.
-    const cardboard = new THREE.MeshStandardMaterial({ color: 0xc98b4e, flatShading: true, side: THREE.DoubleSide });
+    const cardboard = new THREE.MeshStandardMaterial({ color: OBJ.cardboard, flatShading: true, side: THREE.DoubleSide });
     this.chute = new THREE.Group();
     const canopy = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.08, 1.8), cardboard);
     canopy.rotation.z = 0.06;
     this.chute.add(canopy);
-    const tape = new THREE.Mesh(new THREE.BoxGeometry(2.64, 0.09, 0.3), new THREE.MeshStandardMaterial({ color: 0x8a5a2b }));
+    const tape = new THREE.Mesh(new THREE.BoxGeometry(2.64, 0.09, 0.3), new THREE.MeshStandardMaterial({ color: OBJ.paperTape }));
     this.chute.add(tape);
     for (const [x, z] of [[-1.1, -0.7], [1.1, -0.7], [-1.1, 0.7], [1.1, 0.7]]) {
       const s = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 1.3, 3), cardboard);
@@ -74,6 +76,9 @@ export class Character {
 
     const mat = source.material;
     mat.roughness = 0.85;
+    // Warm rim so the courier separates from the rock and snow they spend most
+    // of the game standing in front of.
+    patchMaterial(mat, { rim: { color: 0xffe4bd, power: 2.4, strength: 0.5 } });
 
     // ---- Connected components: the arms are separate shells in this mesh,
     // so they split out EXACTLY. Legs/head are fused and use positional cuts. ----
@@ -208,8 +213,8 @@ export class Character {
     this.legR = mkLimb('legR', this.pelvis, pivots.legR.x, 0);
 
     // Joint caps to hide the cut seams.
-    const capMat = new THREE.MeshStandardMaterial({ color: 0xb7a894, flatShading: true, roughness: 0.9 });
-    const pantsMat = new THREE.MeshStandardMaterial({ color: 0x8d8577, flatShading: true, roughness: 0.9 });
+    const capMat = new THREE.MeshStandardMaterial({ color: OBJ.skin, flatShading: true, roughness: 0.9 });
+    const pantsMat = new THREE.MeshStandardMaterial({ color: OBJ.trousers, flatShading: true, roughness: 0.9 });
     const cap = (parent, r, x, y, m = capMat) => {
       const s = new THREE.Mesh(new THREE.SphereGeometry(r, 7, 5), m);
       s.position.set(x, y, 0);

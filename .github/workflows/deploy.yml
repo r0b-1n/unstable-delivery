@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - claude/unstable-delivery-game-7v97xz
   workflow_dispatch:
 
 permissions:

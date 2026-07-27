@@ -1,17 +1,22 @@
 import * as THREE from 'three';
+import { BAND_KEYS, BAND_EDGES01, bandFloat, bandColor, bandOf, OBJ } from '../art/palette.js';
+import { InstancedPool } from '../art/instanced.js';
 
 export const PEAK = 170;          // summit height in meters
 export const WORLD_R = 240;       // half-extent of the terrain
 export const KILL_Y = -14;
 
-// Vertical difficulty bands (fractions of PEAK).
-export const ZONES = [
-  { name: 'Sunny Meadows',  y0: -5,          y1: PEAK * 0.12, key: 'meadow' },
-  { name: 'Pinewood Ledges', y0: PEAK * 0.12, y1: PEAK * 0.35, key: 'forest' },
-  { name: 'Windy Cliffs',   y0: PEAK * 0.35, y1: PEAK * 0.60, key: 'cliffs' },
-  { name: 'The Frozen Face', y0: PEAK * 0.60, y1: PEAK * 0.85, key: 'frozen' },
-  { name: 'Storm Summit',   y0: PEAK * 0.85, y1: Infinity,    key: 'summit' },
-];
+// Vertical difficulty bands, derived from the palette so the colour a player
+// sees and the zone the rules use can never drift apart. `name` is the English
+// source string and is superseded by `nameKey` once i18n lands.
+const ZONE_NAMES_EN = ['Sunny Meadows', 'Pinewood Ledges', 'Windy Cliffs', 'The Frozen Face', 'Storm Summit'];
+export const ZONES = BAND_KEYS.map((key, i) => ({
+  key,
+  nameKey: `zone.${key}`,
+  name: ZONE_NAMES_EN[i],
+  y0: i === 0 ? -5 : PEAK * BAND_EDGES01[i - 1],
+  y1: i === BAND_KEYS.length - 1 ? Infinity : PEAK * BAND_EDGES01[i],
+}));
 
 export function zoneAt(y) {
   for (const z of ZONES) if (y < z.y1) return z;
@@ -177,17 +182,9 @@ export class Terrain {
     }
 
     // ---- Pass 2: colours, now slope- and curvature-aware ----
-    const cMeadow = new THREE.Color(0x74ce3e);
-    const cMeadow2 = new THREE.Color(0x9fe25b);
-    const cForest = new THREE.Color(0x3d9c50);
-    const cRock = new THREE.Color(0x7d87a8);
-    const cRock2 = new THREE.Color(0x555e78);
-    const cIce = new THREE.Color(0x8ecdf5);
-    const cSnow = new THREE.Color(0xf6faff);
-    const cDirt = new THREE.Color(0xa8763e);
-    const cDirtSnow = new THREE.Color(0xcabb9e);
-    const cFlower = [new THREE.Color(0xffd166), new THREE.Color(0xff7bac), new THREE.Color(0xffffff)];
+    const cFlower = [new THREE.Color(OBJ.liveryGold), new THREE.Color(0xff7bac), new THREE.Color(0xffffff)];
     const col = new THREE.Color();
+    const mix = new THREE.Color();
     const W = SEGMENTS + 1;
     const cell = SIZE / SEGMENTS;
 
@@ -201,34 +198,35 @@ export class Terrain {
       const lap = (hx0 + hx1 + hz0 + hz1 - 4 * h) / cell;                 // concavity
       const pathMix = pathMixArr[i];
 
+      // The jitter is what keeps a band edge from reading as a drawn contour
+      // line: it shuffles each vertex ±5 m across the 15 m-wide cross-fade.
       const jitter = (fbm(x * 0.08, z * 0.08) - 0.5) * 10;
-      const y = h + jitter;
-      if (y < 16) {
-        col.copy(cMeadow).lerp(cMeadow2, fbm(x * 0.11, z * 0.11));
-        // flower speckle
+      const band = bandFloat((h + jitter) / PEAK);
+      bandColor('terrainA', band, col);
+      bandColor('terrainB', band, mix);
+      col.lerp(mix, fbm(x * 0.11, z * 0.11));
+      // Flower speckle, fading out as the meadow gives way to pines.
+      if (band < 1) {
         const f = hash2(Math.round(x * 2.1), Math.round(z * 2.1));
-        if (f > 0.965 && slope < 0.5) col.lerp(cFlower[(f * 977) % 3 | 0], 0.85);
-      } else if (y < 52) {
-        col.copy(cForest).lerp(cMeadow2, fbm(x * 0.13, z * 0.13) * 0.55);
-      } else if (y < 96) {
-        col.copy(cRock).lerp(cRock2, fbm(x * 0.15, z * 0.15));
-      } else if (y < 136) {
-        col.copy(cIce).lerp(cSnow, fbm(x * 0.09, z * 0.09) * 0.6);
-      } else {
-        col.copy(cSnow);
+        if (f > 0.965 && slope < 0.5) col.lerp(cFlower[(f * 977) % 3 | 0], 0.85 * (1 - band));
       }
-      // Steep faces expose rock everywhere above the meadows.
+      // Steep faces expose the band's OWN rock everywhere above the meadows —
+      // one grey rock for the whole mountain flattens the palette back out.
       if (h > 20) {
         const rockK = THREE.MathUtils.smoothstep(slope, 0.85, 1.7);
-        col.lerp(cRock2, rockK * 0.85);
+        col.lerp(bandColor('rock', band, mix), rockK * 0.85);
       }
       // Crevice shading: concave areas darken, ridges brighten slightly.
       const shade = THREE.MathUtils.clamp(1 + lap * 0.05 - Math.max(slope - 1.6, 0) * 0.12, 0.72, 1.12);
       col.multiplyScalar(shade);
-      // Crisp trail.
+      // Crisp trail. In the two cold bands `trail` is the only warm tone on the
+      // mountain — that, not brightness, is what keeps the path visible on snow.
       if (pathMix > 0.45) {
-        const dirt = h > 100 ? cDirtSnow : cDirt;
-        col.lerp(dirt, Math.min((pathMix - 0.45) / 0.4, 1) * 0.9);
+        // Opacity climbs with altitude. Down in the meadow the route is obvious
+        // and a solid brown strip would bury the band that gives Sunny Meadows
+        // its name; on the summit the trail is the only thing telling you where
+        // the ground continues, so up there it goes fully opaque.
+        col.lerp(bandColor('trail', band, mix), Math.min((pathMix - 0.45) / 0.4, 1) * Math.min(0.52 + 0.13 * band, 0.95));
       }
       colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
     }
@@ -272,8 +270,8 @@ export class Terrain {
     const { physics, scene } = this.ctx;
     const R = physics.RAPIER;
     const end = this.pathPoint(1);
-    const islandMat = new THREE.MeshStandardMaterial({ color: 0xd8e9fa, flatShading: true, roughness: 0.9 });
-    const underMat = new THREE.MeshStandardMaterial({ color: 0x8791ad, flatShading: true, roughness: 0.95 });
+    const islandMat = new THREE.MeshStandardMaterial({ color: OBJ.islandTop, flatShading: true, roughness: 0.9 });
+    const underMat = new THREE.MeshStandardMaterial({ color: OBJ.islandUnder, flatShading: true, roughness: 0.95 });
 
     const defs = [];
     const n = 6;
@@ -321,9 +319,9 @@ export class Terrain {
 
     // Pine trees (forest band) — instanced cones + trunks, cylinder colliders.
     const treeGeo = new THREE.ConeGeometry(1.9, 5.2, 6);
-    const treeMat = new THREE.MeshStandardMaterial({ color: 0x2d6a3f, flatShading: true, roughness: 0.9 });
+    const treeMat = new THREE.MeshStandardMaterial({ color: bandOf('forest').veg, flatShading: true, roughness: 0.9 });
     const trunkGeo = new THREE.CylinderGeometry(0.35, 0.45, 2.2, 5);
-    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6e4a2b, flatShading: true, roughness: 0.95 });
+    const trunkMat = new THREE.MeshStandardMaterial({ color: OBJ.timberDark, flatShading: true, roughness: 0.95 });
     const trees = new THREE.InstancedMesh(treeGeo, treeMat, 90);
     const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, 90);
     trees.castShadow = trunks.castShadow = true;
@@ -353,7 +351,9 @@ export class Terrain {
 
     // Scattered boulders-as-decor (static) in the cliff band.
     const rockGeo = new THREE.DodecahedronGeometry(1.4, 0);
-    const rockMat = new THREE.MeshStandardMaterial({ color: 0x6b748f, flatShading: true, roughness: 1 });
+    // Decor boulders take the cliff band's own rock — warm and clearly NOT
+    // `OBJ.hazardRock`, so scenery never gets mistaken for something incoming.
+    const rockMat = new THREE.MeshStandardMaterial({ color: bandOf('cliffs').rock, flatShading: true, roughness: 1 });
     const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 46);
     rocks.castShadow = rocks.receiveShadow = true;
     let rp = 0;
@@ -376,7 +376,7 @@ export class Terrain {
 
     // Glowing crystals near the summit — pure fantasy set dressing.
     const cryGeo = new THREE.OctahedronGeometry(1.1, 0);
-    const cryMat = new THREE.MeshStandardMaterial({ color: 0x7de3ff, emissive: 0x2fb8e6, emissiveIntensity: 1.4, flatShading: true, roughness: 0.3 });
+    const cryMat = new THREE.MeshStandardMaterial({ color: OBJ.emCrystalBody, emissive: OBJ.emCrystal, emissiveIntensity: 1.4, flatShading: true, roughness: 0.3 });
     this.crystals = [];
     for (let i = 0; i < 14; i++) {
       const a = hash2(i, 43.1) * Math.PI * 2;
@@ -397,7 +397,7 @@ export class Terrain {
     const seaGeo = new THREE.RingGeometry(200, 900, 48, 6);
     seaGeo.rotateX(-Math.PI / 2);
     const seaMat = new THREE.MeshStandardMaterial({
-      color: 0x2f74c0, roughness: 0.35, metalness: 0.1, flatShading: true,
+      color: OBJ.sea, roughness: 0.35, metalness: 0.1, flatShading: true,
       transparent: true, opacity: 0.96,
     });
     seaMat.onBeforeCompile = (sh) => {
@@ -415,9 +415,9 @@ export class Terrain {
 
     // --- Lanterns lining the trail (emissive, no per-light cost) ---
     const poleGeo = new THREE.CylinderGeometry(0.06, 0.08, 1.7, 4);
-    const poleMat = new THREE.MeshStandardMaterial({ color: 0x4a3826, flatShading: true });
+    const poleMat = new THREE.MeshStandardMaterial({ color: OBJ.timberDark, flatShading: true });
     const lampGeo = new THREE.SphereGeometry(0.17, 6, 5);
-    const lampMat = new THREE.MeshStandardMaterial({ color: 0xffd166, emissive: 0xffaa33, emissiveIntensity: 2.2 });
+    const lampMat = new THREE.MeshStandardMaterial({ color: OBJ.liveryGold, emissive: OBJ.emLantern, emissiveIntensity: 2.2 });
     const nLan = 46;
     const poles = new THREE.InstancedMesh(poleGeo, poleMat, nLan);
     const lamps = new THREE.InstancedMesh(lampGeo, lampMat, nLan);
@@ -442,7 +442,7 @@ export class Terrain {
 
     // --- Grass tufts + meadow detail ---
     const tuftGeo = new THREE.ConeGeometry(0.16, 0.55, 4);
-    const tuftMat = new THREE.MeshStandardMaterial({ color: 0x57b234, flatShading: true });
+    const tuftMat = new THREE.MeshStandardMaterial({ color: bandOf('meadow').veg, flatShading: true });
     const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, 320);
     let ti = 0;
     for (let i = 0; i < 2200 && ti < 320; i++) {
@@ -461,9 +461,9 @@ export class Terrain {
 
     // --- Snowy pines up high ---
     const spineGeo = new THREE.ConeGeometry(1.6, 4.4, 6);
-    const spineMat = new THREE.MeshStandardMaterial({ color: 0x2c5a46, flatShading: true });
+    const spineMat = new THREE.MeshStandardMaterial({ color: bandOf('frozen').veg, flatShading: true });
     const scapGeo = new THREE.ConeGeometry(1.15, 1.7, 6);
-    const scapMat = new THREE.MeshStandardMaterial({ color: 0xf2f8ff, flatShading: true });
+    const scapMat = new THREE.MeshStandardMaterial({ color: OBJ.snowCap, flatShading: true });
     const spines = new THREE.InstancedMesh(spineGeo, spineMat, 40);
     const scaps = new THREE.InstancedMesh(scapGeo, scapMat, 40);
     spines.castShadow = true;
@@ -490,7 +490,7 @@ export class Terrain {
     this.birds = [];
     const birdGeo = new THREE.ConeGeometry(0.25, 0.9, 3);
     birdGeo.rotateX(Math.PI / 2);
-    const birdMat = new THREE.MeshStandardMaterial({ color: 0x2b2b33, flatShading: true });
+    const birdMat = new THREE.MeshStandardMaterial({ color: OBJ.bird, flatShading: true });
     for (let f = 0; f < 3; f++) {
       const cx = Math.cos(f * 2.1) * (60 + f * 40);
       const cz = Math.sin(f * 2.1) * (60 + f * 40);
@@ -502,23 +502,27 @@ export class Terrain {
       }
     }
 
-    // Drifting low-poly clouds.
+    // Drifting low-poly clouds. Every blob used to build its OWN
+    // IcosahedronGeometry — 60-odd transparent draw calls for set dressing.
+    // One unit icosahedron scaled per instance gives the identical silhouette.
     this.clouds = [];
-    const cloudMat = new THREE.MeshStandardMaterial({ color: 0xffffff, flatShading: true, roughness: 1, transparent: true, opacity: 0.92 });
+    const cloudMat = new THREE.MeshStandardMaterial({ color: OBJ.cloud, flatShading: true, roughness: 1, transparent: true, opacity: 0.92 });
+    this._cloudPool = new InstancedPool(scene, new THREE.IcosahedronGeometry(1, 0), cloudMat, 80, { castShadow: false, dynamic: true });
     for (let i = 0; i < 12; i++) {
-      const g = new THREE.Group();
       const blobs = 2 + ((hash2(i, 61) * 3) | 0);
+      const parts = [];
       for (let b = 0; b <= blobs; b++) {
-        const blob = new THREE.Mesh(new THREE.IcosahedronGeometry(3 + hash2(i, b) * 4, 0), cloudMat);
-        blob.position.set(b * 4 - blobs * 2, hash2(b, i) * 2, hash2(i * 3, b) * 3);
-        blob.scale.y = 0.55;
-        g.add(blob);
+        const r = 3 + hash2(i, b) * 4;
+        const proxy = this._cloudPool.obtain();
+        proxy.scale.set(r, r * 0.55, r);
+        parts.push({ proxy, ox: b * 4 - blobs * 2, oy: hash2(b, i) * 2, oz: hash2(i * 3, b) * 3 });
       }
       const a = hash2(i, 71) * Math.PI * 2;
       const r = 60 + hash2(i, 73) * 160;
-      g.position.set(Math.cos(a) * r, 60 + hash2(i, 79) * 130, Math.sin(a) * r);
-      this.ctx.scene.add(g);
-      this.clouds.push({ g, speed: 1 + hash2(i, 83) * 2.5 });
+      this.clouds.push({
+        pos: new THREE.Vector3(Math.cos(a) * r, 60 + hash2(i, 79) * 130, Math.sin(a) * r),
+        parts, speed: 1 + hash2(i, 83) * 2.5,
+      });
     }
   }
 
@@ -532,9 +536,11 @@ export class Terrain {
     }
     for (const c of this.crystals) c.rotation.y += dt * 0.4;
     for (const c of this.clouds) {
-      c.g.position.x += c.speed * dt;
-      if (c.g.position.x > WORLD_R + 60) c.g.position.x = -WORLD_R - 60;
+      c.pos.x += c.speed * dt;
+      if (c.pos.x > WORLD_R + 60) c.pos.x = -WORLD_R - 60;
+      for (const p of c.parts) p.proxy.position.set(c.pos.x + p.ox, c.pos.y + p.oy, c.pos.z + p.oz);
     }
+    this._cloudPool.flush();
     if (this._seaShader) this._seaShader.uniforms.uTime.value = t;
     for (const b of this.birds) {
       const a = t * b.speed + b.phase;

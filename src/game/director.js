@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { PEAK, zoneAt, KILL_Y } from '../world/terrain.js';
+import { OBJ } from '../art/palette.js';
+import { patchMaterial } from '../art/shaders.js';
+// `tr`, not `t`: fixedUpdate(dt, t) already binds t to the game clock, and a
+// shadowed import fails at runtime as "t is not a function", not at build time.
+import { t as tr } from '../ui/i18n.js';
 
 // The chaos director: ambient hazards (wind, boulders, icicles, lightning)
 // plus SCHEDULED EVENTS with a warning banner — avalanches, boulder rain,
@@ -26,13 +31,19 @@ export class Director {
     this.hazardPay = 0;         // accrues while carrying through a live event
     this._closeCd = 0;          // close-call award cooldown
 
-    this._boulderMat = new THREE.MeshStandardMaterial({ color: 0x5d6480, flatShading: true, roughness: 1 });
-    this._snowMat = new THREE.MeshStandardMaterial({ color: 0xf2f8ff, flatShading: true, roughness: 0.9 });
-    this._icicleMat = new THREE.MeshStandardMaterial({ color: 0xbfe6ff, flatShading: true, roughness: 0.2, transparent: true, opacity: 0.9 });
+    this._boulderMat = new THREE.MeshStandardMaterial({ color: OBJ.hazardRock, flatShading: true, roughness: 1 });
+    this._snowMat = new THREE.MeshStandardMaterial({ color: OBJ.hazardSnow, flatShading: true, roughness: 0.9 });
+    this._icicleMat = new THREE.MeshStandardMaterial({ color: OBJ.hazardIce, flatShading: true, roughness: 0.2, transparent: true, opacity: 0.9 });
+    // Everything that can hurt you wears the same warm rim. It is the one
+    // colour rule the player never has to learn per zone: warm edge = incoming.
+    const hazardLook = { rim: { color: OBJ.hazardRim, power: 2.2, strength: 0.7 }, emissiveFloor: OBJ.hazardEmFloor };
+    patchMaterial(this._boulderMat, hazardLook);
+    patchMaterial(this._snowMat, hazardLook);
+    patchMaterial(this._icicleMat, hazardLook);
 
     this._bolt = new THREE.Mesh(
       new THREE.CylinderGeometry(0.18, 0.5, 90, 5),
-      new THREE.MeshBasicMaterial({ color: 0xeef4ff, transparent: true, opacity: 0.95 }),
+      new THREE.MeshBasicMaterial({ color: OBJ.bolt, transparent: true, opacity: 0.95 }),
     );
     this._bolt.visible = false;
     ctx.scene.add(this._bolt);
@@ -42,9 +53,9 @@ export class Director {
 
   onDelivery(completed) {
     this.level = completed;
-    if (completed === 1) this.ctx.hud.toast('🌬️ The mountain has noticed you.', true);
-    if (completed === 3) this.ctx.hud.toast('🪨 Insurance premiums rising…', true);
-    if (completed === 5) this.ctx.hud.toast('⛈️ The summit storm knows your name.', true);
+    if (completed === 1) this.ctx.hud.toast('toast.noticed', null, { small: true });
+    if (completed === 3) this.ctx.hud.toast('toast.premiums', null, { small: true });
+    if (completed === 5) this.ctx.hud.toast('toast.stormknows', null, { small: true });
   }
 
   // ---------- main tick ----------
@@ -101,6 +112,9 @@ export class Director {
 
     // --- Close-call bonuses: get grazed, get paid ---
     this._closeCd = Math.max(0, this._closeCd - dt);
+    // The streak cools off after eight quiet seconds.
+    this._closeCool = (this._closeCool ?? 0) + dt;
+    if (this._closeCool > 8) this._closeStreak = 0;
     if (this._closeCd <= 0 && player.knockTimer <= 0) {
       const pv = player.body.linvel();
       for (const list of [this.boulders, this.snowballs]) {
@@ -114,7 +128,12 @@ export class Director {
           if (rel < 8) continue;
           b.grazed = true;
           this._closeCd = 1.5;
-          this.ctx.deliveries.addBonus(25, '😅 CLOSE ONE');
+          // 25 / 50 / 100 / 150. A flat rate said the tenth near-miss was worth
+          // exactly as much as the first, which is the opposite of what a
+          // near-miss feels like.
+          this._closeStreak = Math.min((this._closeStreak ?? 0) + 1, 4);
+          this.ctx.deliveries.addBonus([25, 50, 100, 150][this._closeStreak - 1], 'bonus.closeone');
+          this._closeCool = 0;
           this.ctx.sfx.whoosh();
           this.ctx.shake?.(0.08);
           this._tmp.set((bp.x + p.x) / 2, (bp.y + p.y) / 2 + 0.5, (bp.z + p.z) / 2);
@@ -130,8 +149,8 @@ export class Director {
       // Hazard pay: carrying cargo through the chaos accrues a bonus.
       const pkg = this.ctx.packages.current;
       if (pkg?.carried && p.y > 12) {
-        this.hazardPay += dt * 6;
-        this.ctx.hud.banner(`${EVENT_LABELS[this.event.name]}! · ☂ HAZARD PAY +${Math.floor(this.hazardPay)}`);
+        this.hazardPay += dt * (this.ctx.meta?.eff('hazardRate') ?? 6);
+        this.ctx.hud.banner('event.live', { name: tr(`event.${this.event.name}`), n: Math.floor(this.hazardPay) });
       }
       if (this.event.ttl <= 0) {
         this.windMult = 1;
@@ -139,7 +158,9 @@ export class Director {
         this.event = null;
         this._eventTimer = Math.max(26 - this.level * 1.5, 12) + Math.random() * 10;
         if (this.hazardPay >= 1) {
-          this.ctx.deliveries.addBonus(Math.floor(this.hazardPay), '☂ HAZARD PAY');
+          if (this.ctx.shift) this.ctx.shift.stats.hazard += this.hazardPay;
+          this.ctx.deliveries.addBonus(Math.floor(this.hazardPay), 'bonus.hazardpay');
+          this.ctx.hud.stamp('hazard');
           this.ctx.sfx.pickup();
         }
         this.hazardPay = 0;
@@ -155,7 +176,7 @@ export class Director {
       if (this._eventTimer <= 0) {
         const name = this._pickEvent(zone);
         this._eventWarn = { name, ttl: 2.5 };
-        this.ctx.hud.banner(`⚠ ${EVENT_LABELS[name]} INCOMING`);
+        this.ctx.hud.banner('event.incoming', { name: tr(`event.${name}`) });
         this.ctx.sfx.wobble();
         this.ctx.shake?.(0.25);
       }
@@ -175,7 +196,7 @@ export class Director {
 
   _startEvent(name, p, zone) {
     const { hud, sfx } = this.ctx;
-    hud.banner(`${EVENT_LABELS[name]}!`);
+    hud.banner(`event.${name}`);
     const mkEvent = {
       gale: () => {
         this.windMult = 3.4;
@@ -255,7 +276,7 @@ export class Director {
     body.setLinvel({ x: (dx / dl) * 8, y: 0, z: (dz / dl) * 8 }, true);
     this.ctx.registerDynamic(body, 'boulder');
     this.boulders.push({ body, mesh, ttl: 24 });
-    hud.toast('🪨 BOULDER!', true);
+    hud.toast('toast.boulder', null, { small: true });
   }
 
   _dropBoulder(playerPos) {
@@ -339,7 +360,7 @@ export class Director {
         const near = Math.hypot(ip.x - pp.x, ip.y - pp.y, ip.z - pp.z) < 45;
         if (landed && near) {
           this._tmp.set(ip.x, ip.y, ip.z);
-          this.ctx.particles.shards(this._tmp, 0xbfe6ff);
+          this.ctx.particles.shards(this._tmp, OBJ.hazardIce);
           this.ctx.sfx.crack(1);
         }
         this.ctx.unregisterDynamic(ic.body);
@@ -372,14 +393,8 @@ export class Director {
       player.knockdown(1.1);
       const pkg = packages.current;
       if (pkg && pkg.def.fragile) packages.damage(pkg, 25);
-      this.ctx.hud.toast('⚡ DIRECT-ISH HIT', false);
+      this.ctx.hud.toast('toast.lightning');
     }
   }
 }
 
-const EVENT_LABELS = {
-  gale: '🌬️ GALE',
-  boulderRain: '🪨 BOULDER RAIN',
-  avalanche: '🏔️ AVALANCHE',
-  thunder: '⛈️ THUNDERSTORM',
-};

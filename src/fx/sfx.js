@@ -230,6 +230,13 @@ export class Sfx {
     this.tone({ freq: 784, type: 'triangle', peak: 0.16, decay: 0.18, delay: 0.09 });
   }
 
+  // A rubber stamp: wooden knock plus the paper it lands on.
+  stamp() {
+    this.noise({ freq: 900, q: 1.2, peak: 0.22, attack: 0.001, decay: 0.06, type: 'bandpass' });
+    this.tone({ freq: 150, type: 'square', peak: 0.1, attack: 0.001, decay: 0.07 });
+    this.noise({ freq: 4200, peak: 0.05, decay: 0.09, type: 'highpass', delay: 0.02 });
+  }
+
   jingle() {
     const notes = [523, 659, 784, 1047, 784, 1047];
     notes.forEach((f, i) => this.tone({ freq: f, type: 'triangle', peak: 0.17, decay: 0.3, delay: i * 0.11 }));

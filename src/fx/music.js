@@ -67,6 +67,15 @@ export class Music {
     this.intensity = Math.max(0, Math.min(1, v));
   }
 
+  // Pull the bed down under the results sheet so the stamp and the fanfare
+  // land in a hole instead of fighting a running loop.
+  duck(on) {
+    this._ducked = on;
+    if (this.bus && this.enabled) {
+      this.bus.gain.setTargetAtTime(on ? 0.14 : 0.5, this.ctx.currentTime, 0.25);
+    }
+  }
+
   // Look-ahead scheduler: queue every step due in the next 250 ms.
   _schedule() {
     if (!this.playing || !this.enabled) { this._catchUp(); return; }

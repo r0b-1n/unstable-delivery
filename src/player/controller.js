@@ -1,9 +1,13 @@
 import * as THREE from 'three';
 import { zoneAt, KILL_Y } from '../world/terrain.js';
 
-const WALK = 7.2;
+// WALK dropped from 7.2 so the sprint delta reads as a GEAR CHANGE (1.64x,
+// was 1.50x) instead of a nudge. JUMP up from 10.5 with a harsher mass penalty
+// (/70, was /90): unladen you clear more, loaded you clear noticeably less,
+// which is the whole point of carrying something.
+const WALK = 6.6;
 const SPRINT = 10.8;
-const JUMP = 10.5;
+const JUMP = 11.2;
 
 // Dynamic capsule with force-based movement so the world can still shove,
 // launch and bully the courier. Also owns the third-person camera.
@@ -81,6 +85,9 @@ export class PlayerController {
       this.keys.add(e.code);
       if (e.code === 'Space') this.jumpBuffer = 0.14;
       if (e.code === 'KeyF') this._throwOrPunt();
+      // Set down rather than hurl. Seesaws and crate stacks have been in the
+      // world since the first commit with no way to put weight on them.
+      if (e.code === 'KeyG') this.ctx.packages.setDown();
     });
     window.addEventListener('mousedown', (e) => {
       if (e.button === 2 && document.pointerLockElement === this.ctx.renderer.domElement) this._throwOrPunt();
@@ -159,9 +166,10 @@ export class PlayerController {
       if (pkg.def.fragile) this.ctx.packages.damage(pkg, 15);
       pkg.carried = true;
     }
-    this.ctx.hud.toast(pickRespawnQuip(), false);
+    this.ctx.hud.toast(`quip.${(Math.random() * 5) | 0}`);
     this.ctx.sfx.fail();
-    this.ctx.deliveries?.breakChain('respawn');
+    if (this.ctx.shift) this.ctx.shift.stats.falls++;
+    if (!this.ctx.meta?.eff('waiver')) this.ctx.deliveries?.breakChain('reason.respawn');
   }
 
   _groundCheck() {
@@ -240,7 +248,7 @@ export class PlayerController {
     // Heavy cargo slows you down.
     const pkg = this.ctx.packages.current;
     const carryMass = pkg && pkg.carried ? pkg.def.mass : 0;
-    const massFactor = 1 / (1 + carryMass / 60);
+    const massFactor = 1 / (1 + carryMass / (this.ctx.meta?.eff('carryDivisor') ?? 60));
     const speed = (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? SPRINT : WALK) * massFactor;
 
     // --- Velocity approach via impulses so external forces still matter ---
@@ -262,12 +270,13 @@ export class PlayerController {
     // On a hard-landing frame the buffered Space belongs to the recovery
     // roll (below), not to an instant re-jump — otherwise the roll is
     // unreachable: coyote refreshes the moment we touch down.
-    const hardLandingNow = this.grounded && this._wasAirborne && this._lastVy < -17 && !this.airborneBySomethingFun;
+    const fallLimit = this.ctx.meta?.eff('fallThreshold') ?? 17;
+    const hardLandingNow = this.grounded && this._wasAirborne && this._lastVy < -fallLimit && !this.airborneBySomethingFun;
     if (this.jumpBuffer > 0 && this.coyote > 0 && this.knockTimer <= 0 && !hardLandingNow) {
       this.jumpBuffer = 0;
       this.coyote = 0;
       this.slide = false;
-      const jumpV = JUMP * (1 / (1 + carryMass / 90));
+      const jumpV = JUMP * (1 / (1 + carryMass / 70));
       this.body.setLinvel({ x: v.x, y: Math.max(v.y, jumpV), z: v.z }, true);
       sfx.jump();
     }
@@ -279,7 +288,8 @@ export class PlayerController {
       // Strong drag toward a gentle terminal velocity, plus steer authority.
       const targetVy = -3.4;
       this.body.applyImpulse({ x: 0, y: (targetVy - v.y) * m * Math.min(25 * dt, 1), z: 0 }, true);
-      if (hasInput) this.body.applyImpulse({ x: dx * m * 8 * dt, y: 0, z: dz * m * 8 * dt }, true);
+      const steer = this.ctx.meta?.eff('chuteSteer') ?? 8;
+      if (hasInput) this.body.applyImpulse({ x: dx * m * steer * dt, y: 0, z: dz * m * steer * dt }, true);
       this.body.applyImpulse({ x: wind.x * m * 0.04 * dt, y: 0, z: wind.z * m * 0.04 * dt }, true);
       if (!this._parachuteWasOn) sfx.whooshParachute();
     }
@@ -308,7 +318,7 @@ export class PlayerController {
       sfx.thud(Math.min(-this._lastVy / 16, 1.6));
       this.ctx.particles.dust(new THREE.Vector3(p.x, p.y - 0.9, p.z), Math.min(-this._lastVy / 10, 2.4));
       this.ctx.shake?.(Math.min(-this._lastVy / 40, 0.6));
-      if (this._lastVy < -17 && !this.airborneBySomethingFun) {
+      if (this._lastVy < -fallLimit && !this.airborneBySomethingFun) {
         if (this.jumpBuffer > 0) {
           // RECOVERY ROLL: Space just before touchdown converts the crash
           // into a shoulder roll — no knockdown, no cargo damage, keep speed.
@@ -319,13 +329,13 @@ export class PlayerController {
           this.body.applyImpulse({ x: (v.x / hs) * m * 2.5, y: 0, z: (v.z / hs) * m * 2.5 }, true);
           sfx.whooshParachute();
           this.ctx.shake?.(0.18);
-          this.ctx.hud.toast('🌀 ROLLED IT!', true);
+          this.ctx.hud.toast('toast.rolled', null, { small: true });
         } else {
           // Bone-rattler: knockdown, and the cargo feels it too.
           this.knockdown(0.9);
           const pkg = this.ctx.packages.current;
-          if (pkg && pkg.def.fragile) this.ctx.packages.damage(pkg, (-this._lastVy - 17) * 1.8);
-          this.ctx.hud.toast('🦴 That landing had consequences.', true);
+          if (pkg && pkg.def.fragile) this.ctx.packages.damage(pkg, (-this._lastVy - fallLimit) * 1.8);
+          this.ctx.hud.toast('toast.hardlanding', null, { small: true });
         }
       }
     }
@@ -378,13 +388,3 @@ function lerpAngle(a, b, t) {
   return a + d * t;
 }
 
-const QUIPS = [
-  '☠️ Gravity: 1 — You: 0. Back to the checkpoint.',
-  '📋 That fall has been noted in your performance review.',
-  '🏔️ The mountain thanks you for your donation.',
-  '📦 Package status: emotionally damaged. So are you.',
-  '🧾 Respawn fee waived (this time).',
-];
-function pickRespawnQuip() {
-  return QUIPS[(Math.random() * QUIPS.length) | 0];
-}

@@ -8,10 +8,17 @@ import { PlayerController } from './player/controller.js';
 import { Character } from './player/character.js';
 import { Deliveries } from './game/deliveries.js';
 import { Director } from './game/director.js';
+import { Shift } from './game/shift.js';
+import { Meta } from './game/meta.js';
 import { Particles } from './fx/particles.js';
 import { Sfx } from './fx/sfx.js';
 import { Music } from './fx/music.js';
 import { Hud } from './ui/hud.js';
+import { i18n } from './ui/i18n.js';
+import './ui/ud.css';
+import { Mood } from './art/mood.js';
+import { Post } from './fx/post.js';
+import { Quality } from './fx/quality.js';
 
 const app = document.getElementById('app');
 
@@ -27,66 +34,18 @@ renderer.toneMappingExposure = 1.05;
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0xcadef5, 90, 560);
-
-// Sky dome: vertical gradient + sun glow, tinted by altitude and storms.
-const skyUniforms = {
-  topColor: { value: new THREE.Color(0x3f8be0) },
-  horizonColor: { value: new THREE.Color(0xcfe6f8) },
-  sunDir: { value: new THREE.Vector3(0.45, 0.55, 0.3).normalize() },
-  flash: { value: 0 },
-};
-const sky = new THREE.Mesh(
-  new THREE.SphereGeometry(900, 24, 12),
-  new THREE.ShaderMaterial({
-    side: THREE.BackSide,
-    depthWrite: false,
-    uniforms: skyUniforms,
-    vertexShader: `
-      varying vec3 vDir;
-      void main() {
-        vDir = normalize(position);
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: `
-      uniform vec3 topColor, horizonColor, sunDir;
-      uniform float flash;
-      varying vec3 vDir;
-      void main() {
-        float h = clamp(vDir.y, 0.0, 1.0);
-        vec3 col = mix(horizonColor, topColor, pow(h, 0.62));
-        float sun = pow(max(dot(normalize(vDir), sunDir), 0.0), 350.0);
-        float halo = pow(max(dot(normalize(vDir), sunDir), 0.0), 12.0);
-        col += vec3(1.0, 0.93, 0.75) * sun * 1.4 + vec3(1.0, 0.9, 0.7) * halo * 0.22;
-        col = mix(col, vec3(1.0), flash * 0.55);
-        gl_FragColor = vec4(col, 1.0);
-      }`,
-  }),
-);
-sky.frustumCulled = false;
-scene.add(sky);
 
 const camera = new THREE.PerspectiveCamera(68, window.innerWidth / window.innerHeight, 0.1, 1200);
 camera.position.set(0, 30, 60);
 
-const hemi = new THREE.HemisphereLight(0xbcd9ff, 0x8a9389, 1.0);
-scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xfff2dd, 2.2);
-sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.near = 10;
-sun.shadow.camera.far = 340;
-const S = 55;
-sun.shadow.camera.left = -S; sun.shadow.camera.right = S;
-sun.shadow.camera.top = S; sun.shadow.camera.bottom = -S;
-sun.shadow.bias = -0.0004;
-scene.add(sun, sun.target);
-
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // monitor moves change DPR
   renderer.setSize(window.innerWidth, window.innerHeight);
+  // Quality owns pixel ratio — re-applying the tier also re-reads devicePixelRatio,
+  // which changes when the window is dragged to a different monitor.
+  ctx.quality?.apply(ctx.quality.tier);
+  ctx.post?.setSize(window.innerWidth, window.innerHeight);
 });
 
 // ---------- Game context shared by every subsystem ----------
@@ -107,28 +66,60 @@ const ctx = {
     const i = this.dynamics.findIndex((d) => d.body === body);
     if (i >= 0) this.dynamics.splice(i, 1);
   },
+  shift: null,
+  // 0 at clock-in, 1 when the last consignment closes. The light rig reads this
+  // every frame; outside a shift it sits at mid-afternoon so the title screen
+  // and the endless test mode still get a sun.
+  get shift01() { return this.shift?.shift01 ?? 0.35; },
   shake(amt) { trauma = Math.min(1, trauma + amt); },
   hitstop(sec) { hitstopT = Math.max(hitstopT, sec); },
+};
+
+ctx.meta = new Meta();
+ctx.mood = new Mood(ctx);
+ctx.post = new Post(ctx);
+ctx.quality = new Quality(ctx);
+ctx.onQualityChange = (tier, dir) => {
+  ctx.hud?.toast('hud.quality', { tier: tier.key.toUpperCase() }, { small: true });
+  ctx.hud?.setStatus({ quality: tier.key });
+  if (dir === 'down') console.info('[quality] stepped down to', tier.key);
 };
 
 let state = 'loading';
 let gameTime = 0;
 let fps = 60;
+let manualStep = false; // test harness drives the simulation instead of rAF
+
+// Yield to the browser so the loading bar actually paints between steps.
+// Without this the whole boot runs inside one task and the bar jumps from
+// 0 to gone — which is worse than no bar, because it looks broken.
+const yieldFrame = () => new Promise((r) => requestAnimationFrame(r));
 
 async function boot() {
   ctx.sfx = new Sfx();
   ctx.music = new Music(ctx.sfx);
   ctx.hud = new Hud();
-  ctx.particles = new Particles(scene);
+  ctx.hud.ctx = ctx;
+  ctx.hud.boot('boot.physics', 0.05);
+  await yieldFrame();
 
+  ctx.particles = new Particles(scene);
   ctx.physics = new Physics();
   await ctx.physics.init();
 
+  ctx.hud.boot('boot.terrain', 0.2);
+  await yieldFrame();
   ctx.terrain = new Terrain(ctx);
+
+  ctx.hud.boot('boot.props', 0.5);
+  await yieldFrame();
   ctx.props = new Props(ctx);
   ctx.cablecar = new CableCar(ctx);
   ctx.deliveries = new Deliveries(ctx);
   ctx.packages = new Packages(ctx);
+
+  ctx.hud.boot('boot.courier', 0.7);
+  await yieldFrame();
 
   // Spawn beside the depot chute.
   const spawn = ctx.packages.chutePos.clone().add(new THREE.Vector3(-3, 2, -2));
@@ -138,34 +129,153 @@ async function boot() {
   await ctx.character.load();
   ctx.director = new Director(ctx);
 
-  // Title screen ready.
+  // Compile every shader now, while the loading screen is still up. The first
+  // frame otherwise stalls for hundreds of milliseconds on a weak GPU as the
+  // grade, the bloom chain and ~30 material variants all compile at once.
+  ctx.hud.boot('boot.shaders', 0.85);
+  await yieldFrame();
+  renderer.compile(scene, camera);
+
+  ctx.hud.boot('boot.ready', 1);
+  ctx.hud.bindMenu({
+    onStart: () => startGame(),
+    onResume: resumeGame,
+    onAbandon: () => { if (ctx.shift) endShift(); },
+    onNextShift: () => { ctx.hud.hideScreen('results'); ctx.hud.hideScreen('meta'); openBriefing(); },
+    onMeta: () => ctx.hud.meta(ctx.meta.screenData(shiftIndex)),
+    onBuy: (id) => { if (ctx.meta.buy(id)) ctx.hud.meta(ctx.meta.screenData(shiftIndex)); },
+    onLang: () => { ctx.hud.setLang(i18n.toggle()); },
+    onMotion: () => { ctx.hud.setReducedMotion(!ctx.hud.reduced()); },
+    onQuality: () => { ctx.quality.setTier((ctx.quality.tier + 1) % 3); ctx.hud.setStatus({ quality: ctx.quality.current.key }); },
+  });
+  ctx.hud.setStatus({ quality: ctx.quality.current.key, lang: i18n.lang, music: true });
+
   state = 'title';
-  document.getElementById('title-loading').style.display = 'none';
-  document.getElementById('title-start').style.display = 'block';
-  document.getElementById('title-controls').style.display = 'block';
-  document.getElementById('title-screen').addEventListener('click', startGame, { once: true });
+  ctx.hud.titleReady(shiftIndex, ctx.meta.mp);
+  ctx.hud.screens.title.addEventListener('click', openBriefing, { once: true });
 }
 
-function startGame() {
-  document.getElementById('title-screen').style.display = 'none';
+// ---------- Shift lifecycle: title -> briefing -> playing -> results -> meta ----------
+let shiftIndex = 1;
+let pipStreak = 0;
+let endless = false;
+
+function openBriefing() {
+  ctx.sfx.start();
+  ctx.music.start();
+  ctx.shift = new Shift(ctx, shiftIndex, pipStreak);
+  ctx.deliveries.onShiftStart();
+  state = 'briefing';
+  ctx.hud.hideScreen('title');
+  ctx.hud.briefing(ctx.shift.briefing());
+}
+
+// `opts.endless` skips shift termination and `opts.skipBriefing` goes straight
+// to play. The test harness calls start() bare and immediately asserts
+// state === 'playing'; without both defaults on that path the briefing screen
+// strands the entire suite on its first line.
+function startGame(opts = {}) {
+  camera.fov = 68;
+  camera.updateProjectionMatrix();
+  if (!ctx.shift && !opts.endless) openBriefing();
+  endless = !!opts.endless;
+  ctx.hud.hideScreen('title');
+  ctx.hud.hideScreen('briefing');
   ctx.sfx.start();
   ctx.music.start();
   ctx.hud.show();
   ctx.hud.setPackage(null);
-  ctx.hud.toast('📦 Grab your first package at the glowing ring!', false);
+  if (ctx.shift) ctx.hud.setShift({ index: ctx.shift.index, done: ctx.shift.done, total: ctx.shift.total });
+  ctx.hud.toast('toast.firstpickup');
   state = 'playing';
-  renderer.domElement.requestPointerLock?.();
+  requestLock();
+}
+
+function pauseGame() {
+  if (state !== 'playing') return;
+  state = 'paused';
+  ctx.music.duck?.(true);
+  document.exitPointerLock?.();
+  ctx.hud.showScreen('pause');
+}
+
+function resumeGame() {
+  if (state !== 'paused') return;
+  ctx.hud.hideScreen('pause');
+  state = 'playing';
+  ctx.music.duck?.(false);
+  // Drop the wall time spent paused. frame() calls getDelta() every frame
+  // including while paused, so the accumulator never actually banks it — this
+  // is belt and braces against a future frame() that returns earlier.
+  clock.getDelta();
+  requestLock();
+}
+
+ctx.onShiftComplete = () => { if (!endless) endShift(); };
+
+function endShift() {
+  if (!ctx.shift || state === 'results') return;
+  const res = ctx.shift.results();
+  pipStreak = ctx.shift.met ? 0 : pipStreak + 1;
+  const terminated = pipStreak >= 3;
+  ctx.meta?.award(res.mp);
+  state = 'results';
+  document.exitPointerLock?.();
+  ctx.sfx.jingle();
+  ctx.music.fanfare?.();
+  ctx.hud.results(res);
+  // Termination resets the ROUTE, never the progression: merit points,
+  // unlocks and records survive. The sting is narrative, not a wipe.
+  shiftIndex = terminated ? 1 : ctx.shift.index + 1;
+  if (terminated) pipStreak = 0;
+  ctx.shift = null;
+}
+
+// requestPointerLock returns a Promise in Chrome 113+. An unhandled rejection
+// is a pageerror and fails the whole E2E suite, and headless never grants the
+// lock at all. Never pass an options object — { unadjustedMovement } throws
+// NotSupportedError on Firefox.
+function requestLock() {
+  try { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); } catch { /* headless */ }
 }
 
 // Re-lock the pointer when the player clicks back into the game.
 renderer.domElement.addEventListener('click', () => {
-  if (state === 'playing') renderer.domElement.requestPointerLock?.();
+  if (state === 'playing') requestLock();
+});
+
+// The hint is only useful once the lock has been LOST, i.e. after a true->false
+// transition. Reacting to the raw state would show it permanently headless,
+// where document.pointerLockElement is null forever.
+let hadLock = false;
+let photoMode = false;
+document.addEventListener('pointerlockchange', () => {
+  const locked = document.pointerLockElement === renderer.domElement;
+  // Esc is swallowed by the browser while the pointer is locked, so a
+  // true->false transition IS the pause request. Gating on the transition
+  // rather than the raw state is also what keeps headless playable: there
+  // pointerLockElement is null forever and a naive handler pauses on frame 1.
+  if (hadLock && !locked && state === 'playing') pauseGame();
+  hadLock = locked;
 });
 
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'KeyM' && state === 'playing') {
+  if (e.code === 'Escape') {
+    if (state === 'playing') pauseGame();
+    else if (state === 'paused') resumeGame();
+    return;
+  }
+  if (state !== 'playing') return;
+  if (e.code === 'KeyP') {
+    // Photo mode: the art direction deserves a screenshot without the paperwork.
+    photoMode = !photoMode;
+    ctx.hud.setPhotoMode(photoMode);
+    return;
+  }
+  if (e.code === 'KeyM') {
     const on = ctx.music.toggle();
-    ctx.hud.toast(on ? '🎵 Music on' : '🔇 Music off', true);
+    ctx.hud.toast(on ? 'toast.music.on' : 'toast.music.off', null, { small: true });
+    ctx.hud.setStatus({ music: on });
   }
 });
 
@@ -174,9 +284,11 @@ function updateCheckpoint() {
   const p = ctx.player.body.translation();
   for (const st of ctx.cablecar.stations) {
     const d = Math.hypot(p.x - st.pos.x, p.y - st.pos.y, p.z - st.pos.z);
-    if (d < 6 && Math.abs(ctx.checkpoint.y - st.pos.y) > 1) {
+    // Checkpoints only ever move UP. Walking back past a lower station used to
+    // demote you, which would send a return trip all the way to the bottom.
+    if (d < 6 && st.pos.y > ctx.checkpoint.y + 1) {
       ctx.checkpoint.copy(st.pos).add(new THREE.Vector3(0, 0.5, 0));
-      ctx.hud.toast(`🚩 Checkpoint: ${st.name}`, true);
+      ctx.hud.toast('toast.checkpoint', { name: st.name }, { small: true });
       ctx.sfx.pickup();
     }
   }
@@ -185,22 +297,17 @@ function updateCheckpoint() {
 // ---------- Main loop ----------
 const clock = new THREE.Clock();
 
-function frame() {
-  requestAnimationFrame(frame);
-  const realDt = Math.min(clock.getDelta(), 0.1);
-  fps = fps * 0.95 + (1 / Math.max(realDt, 1e-4)) * 0.05;
-
-  if (state !== 'playing') {
-    // Idle orbit behind the title screen (cheap, hidden anyway).
-    renderer.render(scene, camera);
-    return;
-  }
-
+// Everything the world does in one frame, minus the draw. Split out of frame()
+// so the test harness can advance the simulation by exact steps instead of
+// racing a wall clock (see __game.runFrames).
+function stepGame(realDt) {
   // Hitstop: the world freezes for a few frames on big impacts.
+  // 0.06 is a stutter, not a hit: long enough to notice as a frame drop and
+  // short enough to miss as punctuation. Near-freeze instead.
   let dt = realDt;
   if (hitstopT > 0) {
     hitstopT -= realDt;
-    dt = realDt * 0.06;
+    dt = realDt * 0.02;
   }
 
   ctx.physics.step(dt, (fdt) => {
@@ -220,35 +327,30 @@ function frame() {
   ctx.cablecar.update();
   updateCheckpoint();
 
-  // Sun follows the player so shadows stay crisp everywhere on the mountain.
+  // Sky, fog, sun and hemisphere all read the same altitude bands the terrain
+  // is coloured from, so ground and air can never drift apart.
   const p = ctx.player.body.translation();
-  sun.position.set(p.x + 55, p.y + 150, p.z + 35);
-  sun.target.position.set(p.x, p.y, p.z);
-  sky.position.set(p.x, 0, p.z);
-
-  // Altitude mood: bright meadows below, steel-gray storm at the summit.
   const alt01 = THREE.MathUtils.clamp(p.y / PEAK, 0, 1);
-  const storm = THREE.MathUtils.smoothstep(alt01, 0.5, 0.95);
-  const flash = ctx.director.flash;
-  skyUniforms.topColor.value.setRGB(0.25 - storm * 0.1, 0.55 - storm * 0.24, 0.88 - storm * 0.42);
-  skyUniforms.horizonColor.value.setRGB(0.81 - storm * 0.33, 0.9 - storm * 0.38, 0.97 - storm * 0.4);
-  skyUniforms.flash.value = flash;
-  scene.fog.color.copy(skyUniforms.horizonColor.value);
-  hemi.intensity = 1.0 - storm * 0.3 + flash * 1.5;
-  sun.intensity = 2.2 - storm * 0.9 + flash * 2;
+  ctx.mood.update(p, alt01, ctx.director.flash, gameTime, ctx.shift01);
 
   // --- Camera juice: trauma shake + speed FOV kick ---
-  trauma = Math.max(0, trauma - dt * 1.4);
+  // Faster decay (2.6, was 1.4) with LARGER amplitudes. A long soft rumble
+  // reads as a rendering fault; a short hard one reads as an impact.
+  trauma = Math.max(0, trauma - dt * 2.6);
   if (trauma > 0.001) {
     const k = trauma * trauma;
-    camera.position.x += (Math.random() - 0.5) * k * 0.7;
-    camera.position.y += (Math.random() - 0.5) * k * 0.7;
-    camera.rotation.z += (Math.random() - 0.5) * k * 0.06;
+    camera.position.x += (Math.random() - 0.5) * k * 1.15;
+    camera.position.y += (Math.random() - 0.5) * k * 1.15;
+    camera.rotation.z += (Math.random() - 0.5) * k * 0.1;
   }
   const v = ctx.player.body.linvel();
   const speed = Math.hypot(v.x, v.z);
-  const targetFov = 68 + THREE.MathUtils.clamp(speed - 7, 0, 7) * 1.3 + (ctx.player.parachute ? 4 : 0);
-  camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(dt * 5, 1));
+  // Saturates at 17 m/s, not 14. At 14 the kick was almost permanently on and
+  // had stopped signalling anything. Asymmetric response: opens slowly (3),
+  // snaps back fast (9), so slowing down feels like braking.
+  const targetFov = 68 + THREE.MathUtils.clamp(speed - 9, 0, 8) * 1.35 + (ctx.player.parachute ? 4 : 0);
+  const fovRate = targetFov > camera.fov ? 3 : 9;
+  camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, Math.min(dt * fovRate, 1));
   camera.updateProjectionMatrix();
 
   // Airspeed rush: wind-in-the-ears noise swells with total velocity.
@@ -264,12 +366,51 @@ function frame() {
   );
 
   ctx.particles.update(dt, camera, alt01, ctx.wind, ctx.gust);
-  renderer.render(scene, camera);
+}
+
+// Slow orbit around the mountain behind the title card. The scene was already
+// built and already being rendered here; all that was ever missing was
+// somewhere to point the camera. Highest impact per line in the whole plan —
+// until now the entire art investment never reached the first thing anyone sees.
+function titleCamera(t) {
+  const a = 0.8 + t * 0.045;
+  const r = 205 - Math.sin(t * 0.09) * 45;
+  const h = 96 + Math.sin(t * 0.13) * 34;
+  camera.position.set(Math.cos(a) * r, h, Math.sin(a) * r);
+  camera.lookAt(0, 74, 0);
+  if (camera.fov !== 58) { camera.fov = 58; camera.updateProjectionMatrix(); }
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const realDt = Math.min(clock.getDelta(), 0.1);
+  fps = fps * 0.95 + (1 / Math.max(realDt, 1e-4)) * 0.05;
+  ctx.quality.sample(realDt);
+
+  if (state !== 'playing') {
+    // Paused, briefing, results: keep drawing, stop simulating. Behind the
+    // title screen the world is still on camera too, so the sky and light rig
+    // have to keep running or the scene renders as an unlit void.
+    if (state === 'title') titleCamera(clock.elapsedTime);
+    if (ctx.player) {
+      // On the title screen the light rig follows the CAMERA, not the parked
+      // courier — otherwise the sun sits over the depot while the shot is on
+      // the summit, and the whole art direction misses the first thing anyone
+      // ever sees.
+      const p = state === 'title' ? camera.position : ctx.player.body.translation();
+      ctx.mood.update(p, THREE.MathUtils.clamp(p.y / PEAK, 0, 1), 0, clock.elapsedTime, ctx.shift01);
+    }
+    ctx.post.render(realDt, clock.elapsedTime);
+    return;
+  }
+
+  if (!manualStep) stepGame(realDt);
+  ctx.post.render(realDt, gameTime);
 }
 
 boot().catch((e) => {
   console.error(e);
-  document.getElementById('title-loading').textContent = 'Failed to load: ' + e.message;
+  ctx.hud?.fault(e?.stack ?? e?.message ?? e);
 });
 frame();
 
@@ -287,6 +428,40 @@ window.__game = {
   },
   get bodies() { return ctx.physics?.world.bodies.len(); },
   ctx,
-  start: startGame,
+  // Bare start() means "put me in the world now, and never take me out" —
+  // otherwise the briefing screen strands the suite and a completed manifest
+  // would flip state to 'results' halfway through the checks.
+  start: (opts = {}) => startGame({ endless: true, skipBriefing: true, ...opts }),
   teleport(x, y, z) { ctx.player.body.setTranslation({ x, y, z }, true); ctx.player.body.setLinvel({ x: 0, y: 0, z: 0 }, true); },
+  // Advance the world by exact fixed steps, no rendering. Headless runs on
+  // SwiftShader render at ~13 fps, so a wall-clock sleep buys wildly varying
+  // amounts of simulation and the timing-sensitive checks fail at random.
+  // Stepping directly is both deterministic and far faster than waiting.
+  runFrames(n, dt = 1 / 60) {
+    if (state !== 'playing') return 0;
+    manualStep = true;
+    try {
+      for (let i = 0; i < n; i++) stepGame(dt);
+    } finally {
+      manualStep = false;
+      clock.getDelta(); // drop the time spent stepping so fps/dt do not spike
+    }
+    return gameTime;
+  },
+  get gameTime() { return gameTime; },
+  get shift() {
+    const s = ctx.shift;
+    return s && { index: s.index, cursor: s.cursor, quota: s.quota, revenue: s.revenue, manifest: s.manifest };
+  },
+  pause: pauseGame,
+  resume: resumeGame,
+  endShift,
+  get meta() { return ctx.meta?.snapshot(); },
+  resetMeta() { ctx.meta.reset(); },
+  get lang() { return i18n.lang; },
+  setLang(code) { ctx.hud.setLang(code); },
+  i18nAudit() { return i18n.audit(); },
+  get tier() { return ctx.quality?.tier; },
+  get qmode() { return ctx.quality?.mode; },
+  setTier(t) { ctx.quality.setTier(t); },
 };

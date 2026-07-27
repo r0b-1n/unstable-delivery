@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { OBJ } from '../art/palette.js';
+import { InstancedPool } from '../art/instanced.js';
 
 // Interactive physics playground scattered along the route:
 // bounce mushrooms, geyser vents, seesaw planks, elevator platforms,
@@ -20,8 +22,24 @@ export class Props {
     this._build();
   }
 
+  // Twenty mushrooms used to be sixty meshes. One unit geometry each, scaled
+  // per instance, gives the same silhouette for three draw calls.
+  _mushroomPools() {
+    const { scene } = this.ctx;
+    const opts = { dynamic: true }; // the squish animates every frame
+    this._mStem = new InstancedPool(scene, new THREE.CylinderGeometry(0.45, 0.6, 1.4, 7),
+      new THREE.MeshStandardMaterial({ color: OBJ.mushroomStem, flatShading: true }), 24, opts);
+    this._mCap = new InstancedPool(scene, new THREE.SphereGeometry(1.5, 9, 6, 0, Math.PI * 2, 0, Math.PI * 0.5),
+      new THREE.MeshStandardMaterial({ color: OBJ.mushroomCap, flatShading: true, roughness: 0.7 }), 24, opts);
+    this._mDots = new InstancedPool(scene, new THREE.SphereGeometry(1.52, 6, 4, 0, Math.PI * 2, 0, Math.PI * 0.4),
+      new THREE.MeshStandardMaterial({ color: OBJ.mushroomDots, flatShading: true, transparent: true, opacity: 0.4 }), 24,
+      { ...opts, castShadow: false });
+  }
+
   _build() {
     const { terrain } = this.ctx;
+    this._mushroomPools();
+    this._windsocks();
     const path = (t) => {
       const p = terrain.pathPoint(t);
       return new THREE.Vector3(p.x, terrain.heightAt(p.x, p.z), p.z);
@@ -79,6 +97,37 @@ export class Props {
     });
   }
 
+  // The wind already pushes the courier, the cargo, the gondolas, the
+  // particles and the balloons — and until now you could not SEE it anywhere.
+  // Seven socks along the route turn an invisible driving force into something
+  // you can read at a glance and plan a jump around.
+  _windsocks() {
+    const { terrain, scene } = this.ctx;
+    const poleMat = new THREE.MeshStandardMaterial({ color: OBJ.timberDark, flatShading: true });
+    const sockMat = new THREE.MeshStandardMaterial({
+      color: OBJ.hazardRim, emissive: OBJ.hazardRim, emissiveIntensity: 0.25,
+      flatShading: true, side: THREE.DoubleSide,
+    });
+    const TS = [0.15, 0.3, 0.42, 0.55, 0.68, 0.8, 0.9];
+    this._sockPole = new InstancedPool(scene, new THREE.CylinderGeometry(0.09, 0.13, 5.4, 5), poleMat, TS.length);
+    this._sockPool = new InstancedPool(scene, new THREE.CylinderGeometry(0.34, 0.62, 2.1, 7, 1, true), sockMat, TS.length,
+      { castShadow: false, dynamic: true });
+    this.windsocks = [];
+    for (const t of TS) {
+      const p0 = terrain.pathPoint(t), p1 = terrain.pathPoint(t + 0.004);
+      const dx = p1.x - p0.x, dz = p1.z - p0.z;
+      const len = Math.hypot(dx, dz) || 1;
+      const x = p0.x + (-dz / len) * (p0.width + 2.5);
+      const z = p0.z + (dx / len) * (p0.width + 2.5);
+      const y = terrain.heightAt(x, z);
+      this._sockPole.obtain().position.set(x, y + 2.7, z);
+      const sock = this._sockPool.obtain();
+      sock.position.set(x, y + 5.0, z);
+      this.windsocks.push(sock);
+    }
+    this._sockPole.flush();
+  }
+
   _pendulum(t) {
     const { terrain, scene, physics } = this.ctx;
     const R = physics.RAPIER;
@@ -89,7 +138,7 @@ export class Props {
     const dir = new THREE.Vector3(p1.x - p0.x, 0, p1.z - p0.z).normalize();
     const anchor = new THREE.Vector3(p0.x, y + 7.5, p0.z);
 
-    const wood = new THREE.MeshStandardMaterial({ color: 0x7a5230, flatShading: true, roughness: 0.9 });
+    const wood = new THREE.MeshStandardMaterial({ color: OBJ.timberMid, flatShading: true, roughness: 0.9 });
     // Frame: two A-posts + crossbar.
     for (const s of [-1, 1]) {
       const post = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.3, 7.5, 5), wood);
@@ -104,7 +153,7 @@ export class Props {
 
     // The log itself: kinematic, swung by code, hits like a truck.
     const group = new THREE.Group();
-    const rope = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 5.2, 4), new THREE.MeshStandardMaterial({ color: 0x4a3826 }));
+    const rope = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 5.2, 4), new THREE.MeshStandardMaterial({ color: OBJ.timberDark }));
     rope.position.y = 2.6;
     const log = new THREE.Mesh(new THREE.CylinderGeometry(0.75, 0.75, 3.4, 7), wood);
     log.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
@@ -139,7 +188,7 @@ export class Props {
 
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(2.0, 0.22, len),
-      new THREE.MeshStandardMaterial({ color: 0x9a7040, flatShading: true, roughness: 0.95 }),
+      new THREE.MeshStandardMaterial({ color: OBJ.plankPale, flatShading: true, roughness: 0.95 }),
     );
     mesh.castShadow = mesh.receiveShadow = true;
     scene.add(mesh);
@@ -166,7 +215,7 @@ export class Props {
     const across = new THREE.Vector3(p1.x - p0.x, 0, p1.z - p0.z).normalize().cross(new THREE.Vector3(0, 1, 0));
     const mesh = new THREE.Mesh(
       new THREE.CylinderGeometry(0.85, 0.85, 3.6, 8),
-      new THREE.MeshStandardMaterial({ color: 0x6e4a2b, flatShading: true, roughness: 0.9 }),
+      new THREE.MeshStandardMaterial({ color: OBJ.timberDark, flatShading: true, roughness: 0.9 }),
     );
     mesh.castShadow = true;
     scene.add(mesh);
@@ -186,30 +235,23 @@ export class Props {
   }
 
   _mushroom(pos, scale = 1) {
-    const { scene, physics } = this.ctx;
+    const { physics } = this.ctx;
     const R = physics.RAPIER;
+    // The group stays out of the scene graph — it is a pure transform node the
+    // squish animation drives, and the instance proxies hang off it so the
+    // whole mushroom compresses as one.
     const g = new THREE.Group();
-    const stem = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.45 * scale, 0.6 * scale, 1.4 * scale, 7),
-      new THREE.MeshStandardMaterial({ color: 0xf2e7cf, flatShading: true }),
-    );
-    stem.position.y = 0.7 * scale;
-    const cap = new THREE.Mesh(
-      new THREE.SphereGeometry(1.5 * scale, 9, 6, 0, Math.PI * 2, 0, Math.PI * 0.5),
-      new THREE.MeshStandardMaterial({ color: 0xff5d5d, flatShading: true, roughness: 0.7 }),
-    );
-    cap.scale.y = 0.62;
-    cap.position.y = 1.35 * scale;
-    const dots = new THREE.Mesh(
-      new THREE.SphereGeometry(1.52 * scale, 6, 4, 0, Math.PI * 2, 0, Math.PI * 0.4),
-      new THREE.MeshStandardMaterial({ color: 0xffffff, flatShading: true, transparent: true, opacity: 0.4 }),
-    );
-    dots.scale.y = 0.62;
-    dots.position.y = 1.4 * scale;
-    g.add(stem, cap, dots);
     g.position.copy(pos);
-    g.castShadow = true;
-    scene.add(g);
+    const stem = this._mStem.obtain();
+    stem.position.y = 0.7 * scale;
+    stem.scale.setScalar(scale);
+    const cap = this._mCap.obtain();
+    cap.position.y = 1.35 * scale;
+    cap.scale.set(scale, scale * 0.62, scale);
+    const dots = this._mDots.obtain();
+    dots.position.y = 1.4 * scale;
+    dots.scale.set(scale, scale * 0.62, scale);
+    g.add(stem, cap, dots);
 
     const body = physics.world.createRigidBody(R.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y, pos.z));
     physics.world.createCollider(
@@ -224,7 +266,7 @@ export class Props {
     const R = physics.RAPIER;
     const rim = new THREE.Mesh(
       new THREE.CylinderGeometry(2.2, 2.8, 1.2, 8),
-      new THREE.MeshStandardMaterial({ color: 0x9a8f7c, flatShading: true }),
+      new THREE.MeshStandardMaterial({ color: OBJ.geyserRim, flatShading: true }),
     );
     rim.position.set(pos.x, pos.y + 0.3, pos.z);
     scene.add(rim);
@@ -239,7 +281,7 @@ export class Props {
     // Static fulcrum
     const ful = new THREE.Mesh(
       new THREE.ConeGeometry(0.8, 1.4, 5),
-      new THREE.MeshStandardMaterial({ color: 0x8a5a2b, flatShading: true }),
+      new THREE.MeshStandardMaterial({ color: OBJ.timberMid, flatShading: true }),
     );
     ful.position.set(pos.x, pos.y + 0.7, pos.z);
     scene.add(ful);
@@ -255,7 +297,7 @@ export class Props {
     // Dynamic plank on a revolute joint
     const plank = new THREE.Mesh(
       new THREE.BoxGeometry(7.5, 0.3, 1.7),
-      new THREE.MeshStandardMaterial({ color: 0xa9743f, flatShading: true }),
+      new THREE.MeshStandardMaterial({ color: OBJ.crateWood, flatShading: true }),
     );
     plank.castShadow = plank.receiveShadow = true;
     scene.add(plank);
@@ -276,7 +318,7 @@ export class Props {
     const R = physics.RAPIER;
     const mesh = new THREE.Mesh(
       new THREE.CylinderGeometry(2.4, 2.1, 0.5, 8),
-      new THREE.MeshStandardMaterial({ color: 0x8fd0e8, emissive: 0x1b5e77, emissiveIntensity: 0.5, flatShading: true }),
+      new THREE.MeshStandardMaterial({ color: OBJ.liftPad, emissive: OBJ.emLift, emissiveIntensity: 0.5, flatShading: true }),
     );
     mesh.castShadow = mesh.receiveShadow = true;
     scene.add(mesh);
@@ -290,7 +332,7 @@ export class Props {
   _crateStack(pos, n) {
     const { scene, physics } = this.ctx;
     const R = physics.RAPIER;
-    const mat = new THREE.MeshStandardMaterial({ color: 0xb5814a, flatShading: true, roughness: 0.9 });
+    const mat = new THREE.MeshStandardMaterial({ color: OBJ.crateWood, flatShading: true, roughness: 0.9 });
     for (let i = 0; i < n; i++) {
       const s = 0.45 + Math.random() * 0.25;
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(s * 2, s * 2, s * 2), mat);
@@ -339,24 +381,53 @@ export class Props {
             player.airborneBySomethingFun = true;
             player.lastLaunchT = t;
             if (this.boingCombo >= 3) {
-              this.ctx.deliveries.addBonus(10 * this.boingCombo, `🍄 BOING ×${this.boingCombo}`);
+              this.ctx.deliveries.addBonus(10 * this.boingCombo, 'bonus.boing', { n: this.boingCombo });
             }
           }
           d.body.setLinvel({ x: v.x * 0.8, y: launch, z: v.z * 0.8 }, true);
           m.squish = 1;
           this._tmp.set(p.x, m.capY, p.z);
-          particles.pops(this._tmp, 0xff5d5d);
+          particles.pops(this._tmp, OBJ.mushroomCap);
           // Unattended debris bouncing three loops away must not spam audio.
           const dp = Math.hypot(ppc.x - m.pos.x, ppc.y - m.pos.y, ppc.z - m.pos.z);
           if (dp < 45) sfx.boing(pitch);
         }
       }
     }
+    // Windsocks: yaw follows the wind, pitch lifts from limp to horizontal
+    // with its strength. The geometry points down at rest, so a full lift is a
+    // quarter turn about the axis across the wind.
+    const w = this.ctx.wind;
+    const wLen = Math.hypot(w.x, w.z);
+    if (wLen > 0.001) {
+      const lift = Math.min(wLen / 13, 1);
+      const yaw = Math.atan2(w.x, w.z);
+      for (const sock of this.windsocks) {
+        sock.rotation.set(0, yaw, 0);
+        sock.rotateX(-lift * Math.PI * 0.5);
+        // Flutter grows with the gust, so a gale reads as violent, not merely aimed.
+        sock.rotation.z += Math.sin(t * (5 + wLen)) * 0.13 * lift;
+      }
+      this._sockPool.flush();
+    }
+
+    this._mStem.flush();
+    this._mCap.flush();
+    this._mDots.flush();
 
     // Geysers: periodic steam columns that shove everything upward.
     for (const g of this.geysers) {
       const cycle = (t + g.phase) % g.period;
       g.active = cycle < 1.4 ? 1 - cycle / 1.4 : 0;
+      // TELEGRAPH: one second of building hiss and spitting before the column
+      // fires. Without it a geyser is a random shove, not a mechanic you can
+      // read and use.
+      const charge = cycle > g.period - 1.0 ? (cycle - (g.period - 1.0)) / 1.0 : 0;
+      g.charge = charge;
+      if (charge > 0 && Math.random() < dt * 20 * charge) {
+        this._tmp.set(g.pos.x + (Math.random() - 0.5) * 1.6, g.pos.y + 0.6, g.pos.z + (Math.random() - 0.5) * 1.6);
+        particles.steam(this._tmp, 0.35 * charge);
+      }
       if (g.active > 0) {
         this._tmp.set(g.pos.x + (Math.random() - 0.5), g.pos.y + 1, g.pos.z + (Math.random() - 0.5));
         particles.steam(this._tmp, 1 + g.active);
@@ -414,6 +485,10 @@ export class Props {
         pl.mesh.position.copy(pl.mid).x += (Math.random() - 0.5) * 0.06;
         pl.mesh.position.z += (Math.random() - 0.5) * 0.06;
         if (pl.timer <= 0) {
+          // BEAT THE BOARD: cross before it goes and you get paid for it. The
+          // best "oh god I made it" beat in the game produced no receipt at all.
+          const d2 = Math.hypot(pp.x - pl.mid.x, pp.z - pl.mid.z);
+          if (d2 > pl.len / 2 + 1) this.ctx.deliveries.addBonus(30, 'bonus.plank');
           pl.state = 'falling';
           pl.respawn = 9;
           pl.body.setBodyType(this.ctx.physics.RAPIER.RigidBodyType.Dynamic, true);

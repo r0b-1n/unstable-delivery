@@ -3,229 +3,132 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Unstable Delivery</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>" />
+  <title>Unstable Delivery — VPS Vertical Parcel Service</title>
+  <meta name="description" content="Haul absurd cargo up a mountain for a logistics company that should not legally exist. Do not shake the potion." />
+  <meta property="og:title" content="Unstable Delivery" />
+  <meta property="og:description" content="UPHILL. ON TIME. MOSTLY. A physics delivery game for the Vertical Parcel Service." />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="./assets/cover.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 40%22><rect width=%2264%22 height=%2240%22 fill=%22%23A83619%22/><g fill=%22%23FFD166%22><path d=%22M2 30 L10 30 L18 14 L10 14 Z%22/><path d=%22M14 30 L22 30 L32 8 L24 8 Z%22/><path d=%22M28 30 L36 30 L48 2 L40 2 Z%22/><rect x=%2244%22 y=%2218%22 width=%2218%22 height=%2216%22/></g></svg>" />
   <style>
+    /* Critical shell only. Everything else lives in src/ui/ud.css. */
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1530; }
-    body { font-family: 'Trebuchet MS', 'Segoe UI', system-ui, sans-serif; user-select: none; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0f1a; }
+    body { font-family: 'Oswald', 'Arial Narrow', system-ui, sans-serif; user-select: none; }
     #app { position: fixed; inset: 0; }
     canvas { display: block; }
-
-    /* ---------- Title screen ---------- */
-    #title-screen {
-      position: fixed; inset: 0; z-index: 40;
-      display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
-      background: radial-gradient(ellipse at 50% 30%, #21407a 0%, #0b1530 80%);
-      cursor: pointer;
-    }
-    #title-cover {
-      position: absolute; inset: 0;
-      background: url('./assets/cover.png') center 20% / cover no-repeat;
-      filter: saturate(1.05);
-    }
-    #title-cover::after {
-      content: ''; position: absolute; inset: 0;
-      background: linear-gradient(to bottom, rgba(11,21,48,0) 40%, rgba(11,21,48,0.92) 92%);
-    }
-    #title-bottom { position: relative; z-index: 2; text-align: center; padding-bottom: 5vh; }
-    #title-start {
-      font-size: 28px; font-weight: 800; color: #fff; letter-spacing: 1px;
-      text-shadow: 0 2px 8px #000;
-      animation: pulse 1.4s ease-in-out infinite;
-    }
-    @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: .65; transform: scale(.97);} }
-    #title-controls {
-      margin-top: 14px; color: #bcd3f5; font-size: 14px; line-height: 1.7;
-      text-shadow: 0 1px 4px #000;
-    }
-    #title-controls b { color: #ffd166; }
-    #title-loading { font-size: 22px; color: #9fc0ee; font-weight: 700; text-shadow: 0 2px 8px #000; }
-
-    /* ---------- HUD ---------- */
-    #hud { position: fixed; inset: 0; z-index: 20; pointer-events: none; display: none; }
-    .panel {
-      background: rgba(10, 20, 44, 0.72);
-      border: 2px solid rgba(140, 180, 240, 0.35);
-      border-radius: 12px;
-      color: #eaf2ff;
-      backdrop-filter: blur(3px);
-    }
-
-    #hud-top-left { position: absolute; top: 14px; left: 14px; padding: 10px 14px; min-width: 230px; }
-    #hud-package-name { font-size: 17px; font-weight: 800; color: #ffd166; }
-    #hud-package-note { font-size: 12px; color: #a8c4ea; margin-top: 2px; font-style: italic; }
-    .bar-wrap { margin-top: 7px; }
-    .bar-label { font-size: 10px; letter-spacing: 1.5px; color: #8fb0dd; }
-    .bar { height: 10px; border-radius: 5px; background: rgba(255,255,255,0.12); overflow: hidden; margin-top: 2px; }
-    .bar > div { height: 100%; border-radius: 5px; transition: width .15s ease-out; }
-    #bar-condition > div { background: linear-gradient(90deg, #45d17a, #a8e063); width: 100%; }
-    #bar-shake    > div { background: linear-gradient(90deg, #ffb347, #ff4d6d); width: 0%; }
-    #row-shake { display: none; }
-
-    #hud-top-right { position: absolute; top: 14px; right: 14px; padding: 10px 16px; text-align: right; }
-    #hud-score { font-size: 24px; font-weight: 900; color: #ffd166; }
-    #hud-deliveries { font-size: 12px; color: #a8c4ea; margin-top: 2px; }
-    #hud-alt { font-size: 13px; color: #bfe0ff; margin-top: 6px; font-weight: 700; }
-    #hud-chain {
-      display: none; font-size: 13px; font-weight: 900; color: #ff9f43; margin-top: 4px;
-    }
-    #hud-chain.pop { animation: chain-pop .35s ease-out; }
-    @keyframes chain-pop { 0% { transform: scale(1.6); } 100% { transform: scale(1); } }
-
-    /* Floating itemized score receipts */
-    #pop-holder {
-      position: absolute; top: 34%; right: 12%;
-      display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
-    }
-    .score-pop {
-      text-align: right; font-size: 17px; font-weight: 900; color: #ffd166;
-      text-shadow: 0 2px 6px #000, 0 0 12px rgba(255, 209, 102, .35);
-      animation: pop-in 2.5s ease-out forwards;
-    }
-    .score-pop div:last-child { font-size: 21px; color: #fff; margin-top: 2px; }
-    @keyframes pop-in {
-      0% { opacity: 0; transform: translateY(10px) scale(.8); }
-      10% { opacity: 1; transform: translateY(0) scale(1.06); }
-      16% { transform: scale(1); }
-      75% { opacity: 1; transform: translateY(-6px); }
-      100% { opacity: 0; transform: translateY(-18px); }
-    }
-
-    /* Critical condition: the bar itself panics */
-    .bar.crit { animation: bar-panic .5s ease-in-out infinite; }
-    @keyframes bar-panic {
-      0%, 100% { transform: translateX(0); }
-      25% { transform: translateX(-1.5px); }
-      75% { transform: translateX(1.5px); }
-    }
-
-    /* Delivery direction indicator */
-    #hud-target {
-      position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
-      padding: 8px 18px; text-align: center;
-    }
-    #hud-target-arrow { font-size: 22px; display: inline-block; transition: transform .1s linear; color: #ffd166; }
-    #hud-target-dist { font-size: 13px; font-weight: 800; color: #eaf2ff; }
-    #hud-target-label { font-size: 10px; letter-spacing: 1.5px; color: #8fb0dd; }
-
-    #hud-banner {
-      position: absolute; top: 76px; left: 50%; transform: translateX(-50%);
-      padding: 8px 30px; font-size: 24px; font-weight: 900; letter-spacing: 1px;
-      color: #fff; background: rgba(160, 30, 30, 0.85);
-      border: 2px solid rgba(255, 120, 120, 0.8); border-radius: 12px;
-      text-shadow: 0 2px 6px #000; display: none;
-      animation: banner-pulse 0.7s ease-in-out infinite;
-    }
-    @keyframes banner-pulse { 0%,100% { transform: translateX(-50%) scale(1);} 50% { transform: translateX(-50%) scale(1.05);} }
-
-    #hud-timer { font-size: 12px; color: #ffd166; margin-top: 3px; font-weight: 700; }
-    #hud-timer.expired { color: #8fb0dd; font-weight: 400; }
-
-    #hud-hint {
-      position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
-      padding: 6px 16px; font-size: 12.5px; color: #bcd3f5; white-space: nowrap;
-    }
-    #hud-hint b { color: #ffd166; }
-
-    /* Center toasts */
-    #toast-holder {
-      position: absolute; top: 22%; left: 0; right: 0;
-      display: flex; flex-direction: column; align-items: center; gap: 8px;
-    }
-    .toast {
-      padding: 10px 26px; font-size: 22px; font-weight: 900; color: #fff;
-      background: rgba(10, 20, 44, 0.8); border: 2px solid rgba(255, 209, 102, 0.6);
-      border-radius: 14px; text-shadow: 0 2px 6px #000;
-      animation: toast-in 3.2s ease-out forwards;
-    }
-    .toast.small { font-size: 15px; font-weight: 700; border-color: rgba(140,180,240,.4); }
-    @keyframes toast-in {
-      0% { opacity: 0; transform: translateY(-14px) scale(.9); }
-      8% { opacity: 1; transform: translateY(0) scale(1.04); }
-      12% { transform: scale(1); }
-      80% { opacity: 1; }
-      100% { opacity: 0; transform: translateY(-8px); }
-    }
-
-    /* Delivery slip */
-    #slip {
-      position: absolute; bottom: 60px; right: 18px; width: 250px;
-      background: #f5ecd7; color: #3a2c18; border-radius: 4px;
-      padding: 12px 14px; font-size: 13px; line-height: 1.5;
-      box-shadow: 0 6px 18px rgba(0,0,0,.45);
-      transform: rotate(2.5deg);
-      display: none;
-      font-family: 'Courier New', monospace;
-    }
-    #slip::before {
-      content: 'DELIVERY SLIP #' attr(data-num);
-      display: block; font-weight: 700; letter-spacing: 1px;
-      border-bottom: 2px dashed #b7a684; padding-bottom: 5px; margin-bottom: 7px;
-      font-size: 11px; color: #7a6238;
-    }
-    #slip-body b { font-size: 14.5px; }
-    #slip-warning { margin-top: 6px; font-weight: 700; color: #a83232; font-size: 12px; }
-
-    #vignette-damage {
-      position: absolute; inset: 0; pointer-events: none; opacity: 0;
-      background: radial-gradient(ellipse at center, transparent 55%, rgba(255,40,40,.55) 100%);
-      transition: opacity .1s;
-    }
+    /* Hide the screens until the stylesheet lands, or every sheet flashes
+       stacked on top of each other on a cold load. The `display` on #ud-title
+       MUST be scoped to .on — an unscoped ID rule (specificity 100) outranks
+       .ud-screen-overlay (10) and pins the title screen open forever. */
+    .ud-screen-overlay { display: none; }
+    #ud-title { position: fixed; inset: 0; z-index: 40; background: #0a0f1a; }
+    #ud-title.on { display: flex; align-items: flex-end; justify-content: center; }
   </style>
 </head>
 <body>
   <div id="app"></div>
 
-  <div id="hud">
-    <div id="hud-top-left" class="panel">
-      <div id="hud-package-name">No package</div>
-      <div id="hud-package-note">Head to the depot chute!</div>
-      <div class="bar-wrap" id="row-condition">
-        <div class="bar-label">CONDITION</div>
-        <div class="bar" id="bar-condition"><div></div></div>
+  <div id="hud" aria-live="polite">
+    <!-- Consignment card: the company, in writing -->
+    <div id="ud-consignment" class="ud-paper">
+      <div class="ud-cardhead">
+        <div>
+          <div class="ud-label" data-i18n="hud.consignment">CONSIGNMENT</div>
+          <div id="ud-pkg-name" data-i18n="hud.nopackage">NO CONSIGNMENT</div>
+        </div>
+        <div id="ud-mark"></div>
       </div>
-      <div class="bar-wrap" id="row-shake">
-        <div class="bar-label">INSTABILITY</div>
-        <div class="bar" id="bar-shake"><div></div></div>
+      <div id="ud-pkg-note" data-i18n="hud.nopackage.note">Collect at the depot chute.</div>
+      <div id="ud-stack" class="ud-label"></div>
+
+      <div class="ud-meter" id="ud-meter-condition" data-state="ok" hidden>
+        <div class="ud-meter-head">
+          <span class="ud-label" data-i18n="hud.condition">CONDITION</span>
+          <span class="ud-meter-val">100%</span>
+        </div>
+        <div class="ud-ticks"></div>
+      </div>
+      <div class="ud-meter" id="ud-meter-shake" data-state="ok" hidden>
+        <div class="ud-meter-head">
+          <span class="ud-label" data-i18n="hud.instability">INSTABILITY</span>
+          <span class="ud-meter-val">0%</span>
+        </div>
+        <div class="ud-ticks"></div>
       </div>
     </div>
 
-    <div id="hud-top-right" class="panel">
-      <div id="hud-score">0</div>
-      <div id="hud-deliveries">0 deliveries</div>
-      <div id="hud-alt">ALT 0 m</div>
-      <div id="hud-chain"></div>
+    <!-- Navigation: the courier's handheld, live -->
+    <div id="ud-nav" class="ud-screen">
+      <span id="ud-nav-label" class="ud-label" data-i18n="hud.deliverto">DELIVER TO</span>
+      <div id="ud-nav-row">
+        <span id="ud-arrow">➤</span>
+        <span id="ud-dist" class="ud-num">--</span>
+      </div>
+      <div id="ud-timer"></div>
     </div>
 
-    <div id="pop-holder"></div>
-
-    <div id="hud-target" class="panel">
-      <div id="hud-target-label">DELIVER TO</div>
-      <div><span id="hud-target-arrow">➤</span> <span id="hud-target-dist">--</span></div>
-      <div id="hud-timer"></div>
+    <div id="ud-revenue" class="ud-screen">
+      <div class="ud-label" data-i18n="hud.revenue">REVENUE</div>
+      <div id="ud-score" class="ud-num">0</div>
+      <div id="ud-deliveries">0</div>
+      <div id="ud-alt">ALT 0 m</div>
+      <div id="ud-shift" class="ud-label"></div>
+      <div id="ud-chain"></div>
     </div>
 
-    <div id="hud-banner"></div>
+    <div id="ud-pops"></div>
+    <div id="ud-banner" role="alert"></div>
+    <div id="ud-toasts"></div>
 
-    <div id="hud-hint" class="panel"><b>WASD</b> move · <b>Shift</b> sprint · <b>Space</b> jump / hold in air: parachute / tap before landing: roll · <b>F</b> throw / kick · <b>C</b> slide · <b>M</b> music</div>
+    <!-- Waybill -->
+    <div id="ud-waybill" class="ud-paper ud-perf">
+      <div class="ud-wb-head">
+        <div>
+          <div class="ud-wb-title" data-i18n="hud.waybill">WAYBILL</div>
+          <div id="ud-wb-no">No. 000</div>
+        </div>
+        <div class="ud-wb-mark"></div>
+      </div>
+      <div class="ud-field">
+        <div class="ud-label" data-i18n="hud.consignment">CONSIGNMENT</div>
+        <div class="ud-field-val" id="ud-wb-item"></div>
+      </div>
+      <div class="ud-field">
+        <div class="ud-label" data-i18n="hud.consignee">CONSIGNEE</div>
+        <div class="ud-field-val" id="ud-wb-to"></div>
+      </div>
+      <div id="ud-wb-warning"></div>
+      <div id="ud-barcode"></div>
+      <div id="ud-wb-track"></div>
+    </div>
 
-    <div id="toast-holder"></div>
-    <div id="slip" data-num="001"><div id="slip-body"></div><div id="slip-warning"></div></div>
-    <div id="vignette-damage"></div>
+    <div id="ud-hint" class="ud-screen" data-i18n-html="hint.controls"></div>
+    <div id="ud-lockhint" class="ud-screen" data-i18n="hud.lockhint"></div>
+    <div id="ud-status"></div>
   </div>
 
-  <div id="title-screen">
-    <div id="title-cover"></div>
-    <div id="title-bottom">
-      <div id="title-loading">Loading the mountain…</div>
-      <div id="title-start" style="display:none">CLICK TO START YOUR SHIFT</div>
-      <div id="title-controls" style="display:none">
-        <b>WASD</b> move &nbsp;·&nbsp; <b>Shift</b> sprint &nbsp;·&nbsp; <b>Space</b> jump (hold in air = parachute, tap before landing = roll) &nbsp;·&nbsp; <b>F</b> throw / kick &nbsp;·&nbsp; <b>C</b> belly slide<br/>
-        Grab packages at the depot, haul them up the mountain, ride the cable car. Don't shake the potion.
-      </div>
+  <!-- Screens are SIBLINGS of #hud so hud.show() can never orphan them. -->
+  <div id="ud-title" class="ud-screen-overlay on">
+    <div class="ud-title-inner">
+      <div class="ud-wordmark">VPS</div>
+      <div class="ud-wordmark-sub" data-i18n="brand.full">Vertical Parcel Service</div>
+      <div id="ud-title-tagline" data-i18n="brand.tagline">UPHILL. ON TIME. MOSTLY.</div>
+      <div id="ud-title-loading" data-i18n="title.loading">Loading the mountain…</div>
+      <div id="ud-title-bar"><i></i></div>
+      <div id="ud-title-start" data-i18n="title.start" hidden>CLICK TO START YOUR SHIFT</div>
+      <div id="ud-title-controls" data-i18n-html="title.controls" hidden></div>
+      <div id="ud-title-blurb" data-i18n="title.blurb" hidden></div>
+      <div class="ud-btnrow" id="ud-title-actions" style="justify-content:center" hidden></div>
     </div>
   </div>
+
+  <div id="ud-briefing" class="ud-screen-overlay"><div class="ud-sheet"></div></div>
+  <div id="ud-pause" class="ud-screen-overlay"><div class="ud-sheet"></div></div>
+  <div id="ud-results" class="ud-screen-overlay"><div class="ud-sheet"></div></div>
+  <div id="ud-meta" class="ud-screen-overlay"><div class="ud-sheet"></div></div>
+  <div id="ud-fault" class="ud-screen-overlay"><div class="ud-sheet"></div></div>
 
   <script type="module" src="/src/main.js"></script>
 </body>
