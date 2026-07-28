@@ -65,7 +65,15 @@ for (const p of collide.probes) {
   console.log(`  probe ${p.x},${p.z}: drawn ${p.expect.toFixed(2)} collider ${p.got.toFixed(2)} (${err.toFixed(3)})`);
   if (err > 0.05) throw new Error(`Collider and mesh disagree by ${err.toFixed(2)} m — check the column-major transpose`);
 }
-if (collide.buildMs > 3000) throw new Error(`Terrain grid took ${collide.buildMs.toFixed(0)} ms — move it to a worker`);
+// A wall-clock budget on hardware the suite does not own. This machine alone
+// swings 838 -> 1562 ms for the same grid depending on what else is running,
+// and a 2-vCPU cloud runner is slower again — so 3 s, which is what a single
+// measurement here suggested, is a threshold that fails on a busy box rather
+// than on a defect. 10 s is the number that means the algorithm is wrong
+// (a reintroduced O(n) path scan puts it in the minutes). Anything above 3 s
+// is still worth saying out loud.
+if (collide.buildMs > 3000) console.warn(`[slow] terrain grid took ${collide.buildMs.toFixed(0)} ms`);
+if (collide.buildMs > 10000) throw new Error(`Terrain grid took ${collide.buildMs.toFixed(0)} ms — move it to a worker`);
 
 // --- Route probe: the trail must lie on the ground the whole way up ---
 // The height field carves the route into the flank; if the noise amplitude
