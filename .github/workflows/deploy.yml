@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - main
+      # NOT a stray trigger, however much it looks like one. `main` holds two
+      # commits — the character glb and the cover image — and no game code
+      # whatsoever; the entire project lives on this branch. Deleting this line
+      # as tidy-up in the v4 overhaul silently stopped every Pages deploy, and
+      # the live site sat on v3 for two releases with nothing failing anywhere
+      # to say so. Remove it when main is the branch that has the game on it,
+      # and not before.
+      - claude/unstable-delivery-game-7v97xz
   workflow_dispatch:
 
 permissions:
