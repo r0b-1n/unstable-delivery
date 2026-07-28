@@ -14,6 +14,10 @@ const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--no-sandbox'],
 });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+// Playwright's 30 s default is a page-interaction budget, and a screenshot here
+// is a software-rasterised frame of a 1600 m mountain. On a two-core runner
+// that is not an interaction, it is a render job.
+page.setDefaultTimeout(90000);
 const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push('PAGEERROR: ' + e.message));
@@ -29,6 +33,18 @@ console.log('TITLE OK');
 
 // Start the game programmatically (pointer lock will fail silently headless, fine)
 await page.evaluate(() => window.__game.start());
+// Run the whole suite on the low tier.
+//
+// This is a gameplay regression suite, not a look test — the art is judged by
+// scripts/shots.mjs, by a person, on hardware with a GPU. Here every frame is
+// rasterised in software, and the high tier means 4x MSAA plus a five-pass
+// bloom chain plus every far scatter pool over a mountain that is now 1600 m
+// across. The screenshot from summit altitude, where most of the map is in
+// frustum at once, blew a 30 s capture budget on a two-core CI runner.
+//
+// The low tier drops MSAA, bloom and the shadowless far pools. None of it is
+// load-bearing for anything the suite asserts.
+await page.evaluate(() => window.__game.setTier(0));
 await page.waitForTimeout(1500);
 const pos0 = await page.evaluate(() => window.__game.playerPos);
 console.log('spawn pos', pos0.map((n) => n.toFixed(1)).join(', '));
@@ -605,12 +621,15 @@ const gfx = await page.evaluate(() => {
 });
 console.log('render:', JSON.stringify(gfx));
 
-for (const t of [0, 1, 2]) {
+// Sweep all three, land back on the cheap one: the checks after this still
+// take screenshots, and leaving the suite on the high tier hands them the
+// bloom chain and 4x MSAA again.
+for (const t of [1, 2, 0]) {
   await page.evaluate((n) => window.__game.setTier(n), t);
   await page.waitForTimeout(250);
 }
 const tierBack = await page.evaluate(() => window.__game.tier);
-if (tierBack !== 2) throw new Error(`setTier did not stick (got ${tierBack})`);
+if (tierBack !== 0) throw new Error(`setTier did not stick (got ${tierBack})`);
 console.log('quality tiers: ok');
 
 const stats = await page.evaluate(() => ({ fps: window.__game.fps, bodies: window.__game.bodies }));
